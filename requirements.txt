@@ -1,0 +1,7 @@
+pandas>=2.0
+numpy>=1.24
+akshare>=1.14
+pyyaml>=6.0
+rich>=13.0
+tabulate>=0.9
+pytest>=8.0

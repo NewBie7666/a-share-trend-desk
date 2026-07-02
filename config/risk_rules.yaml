@@ -1,0 +1,28 @@
+market_state:
+  green_hs300_above_ma: 20
+  green_pool_above_ma20_ratio: 0.60
+  green_pool_rs_strong_ratio: 0.50
+  yellow_hs300_above_ma: 60
+  yellow_pool_above_ma20_ratio: 0.35
+  red_pool_above_ma20_below_ratio: 0.30
+  red_pool_below_ma60_ratio: 0.50
+
+filters:
+  min_history_days: 120
+  max_5d_return: 0.15
+  max_10d_return: 0.25
+  max_ma20_deviation: 0.12
+  limit_up_pct: 0.095
+  long_upper_shadow_ratio: 1.5
+  long_upper_shadow_amount_multiple: 1.5
+  long_upper_shadow_close_below_high: 0.03
+  huge_amount_multiple: 2.0
+  huge_amount_days: 3
+
+condition_order:
+  trigger_close_multiple: 1.01
+  trigger_ma20_multiple: 1.005
+  stop_loss_buy_multiple: 0.92
+  stop_loss_ma60_multiple: 0.99
+  take_profit_reduce_multiple: 1.25
+  take_profit_strong_multiple: 1.40
