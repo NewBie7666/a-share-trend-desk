@@ -22,11 +22,11 @@ from .data_fetcher import (
     write_fetch_failure_log,
 )
 from .data_quality import compute_data_quality_report
-from .filters import evaluate_hard_filters
 from .indicators import add_indicators
-from .market_state import evaluate_market_state
+from .market_state import evaluate_market_state_from_snapshots
 from .report import write_reports
-from .signals import evaluate_holdings, generate_buy_signals
+from .signals import evaluate_holdings_from_snapshots, generate_buy_signals_from_snapshots
+from .snapshots import build_stock_snapshots, snapshot_data_issue_list
 from .utils import ensure_directories, load_config, load_holdings
 
 
@@ -402,29 +402,28 @@ def run_daily_signal() -> int:
             }
         )
 
-    stock_frames = {}
-    filter_reasons = {}
-    valid_for_signal = {result.symbol: result for result in stock_results if result.final_source in {"fresh", "cache"} and not result.data.empty and result.error_category not in {"stale_cache", "no_expected_trade_date_data", "data_not_ready", "insufficient_history"}}
-    for result in stock_results:
-        if result.symbol not in valid_for_signal:
-            continue
-        enriched = add_indicators(result.data, hs300)
-        stock_frames[result.symbol] = enriched
-        filter_reasons[result.symbol] = evaluate_hard_filters(result.symbol, result.name, enriched, settings, risk_rules["filters"])
+    snapshots_by_symbol, performance_summary = build_stock_snapshots(
+        stock_results,
+        names,
+        settings,
+        risk_rules,
+        hs300,
+    )
+    performance_summary["index_indicator_compute_count"] = sum(1 for item in index_results if not item["result"].data.empty)
+    settings["performance_summary"] = performance_summary
+    settings["data_issue_list"] = snapshot_data_issue_list(snapshots_by_symbol)
 
     console.print("[bold]Step 4/5: evaluating market state and signals...[/bold]")
-    market = evaluate_market_state(
+    market = evaluate_market_state_from_snapshots(
         hs300,
-        stock_frames,
+        snapshots_by_symbol,
         risk_rules,
-        names,
         confirmed_style_symbols,
         market_index_table,
         data_quality_level,
         settings,
-        stock_results_by_symbol,
     )
-    signals = generate_buy_signals(market, stock_frames, names, filter_reasons, settings, risk_rules, holdings, data_quality_level, stock_results_by_symbol)
+    signals = generate_buy_signals_from_snapshots(market, snapshots_by_symbol, settings, risk_rules, holdings, data_quality_level)
     temp_candidate_symbols = {
         str(item.get("symbol", "")).zfill(6)
         for item in signals.get("candidates", [])
@@ -444,7 +443,7 @@ def run_daily_signal() -> int:
     if pool_used_cache:
         cache_notes.append(f"股票基础信息使用缓存或备用池：{pool_error or '实时股票池不可用'}")
     cache_notes.append(f"本次扫描股票数量：{len(stock_pool)}")
-    holding_actions = evaluate_holdings(holdings, stock_frames, market, settings, risk_rules)
+    holding_actions = evaluate_holdings_from_snapshots(holdings, snapshots_by_symbol, market, settings, risk_rules)
 
     console.print("[bold]Step 5/5: writing reports...[/bold]")
     md_path, csv_path = write_reports(market, signals, holding_actions, used_cache, cache_notes, settings)

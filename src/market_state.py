@@ -4,6 +4,7 @@ import pandas as pd
 
 from .position_rules import get_position_rule
 from .styles import build_style_state_table
+from .snapshots import snapshot_fetch_results, snapshot_names, snapshots_to_frames
 
 
 def _index_state(close: float, ma20: float, ma60: float) -> str:
@@ -194,3 +195,25 @@ def evaluate_market_state(
         "data_quality_level": data_quality_level,
         "portfolio_mode": _portfolio_mode(state, style_state_table, data_quality_level, settings),
     }
+
+
+def evaluate_market_state_from_snapshots(
+    hs300_df: pd.DataFrame,
+    snapshots_by_symbol: dict,
+    rules: dict,
+    confirmed_style_symbols: set[str] | None = None,
+    market_index_table: list[dict] | None = None,
+    data_quality_level: str = "fresh",
+    settings: dict | None = None,
+) -> dict:
+    return evaluate_market_state(
+        hs300_df,
+        snapshots_to_frames(snapshots_by_symbol),
+        rules,
+        snapshot_names(snapshots_by_symbol),
+        confirmed_style_symbols,
+        market_index_table,
+        data_quality_level,
+        settings,
+        snapshot_fetch_results(snapshots_by_symbol),
+    )

@@ -109,7 +109,9 @@ def write_reports(
 
     candidate_columns = [
         "candidate_rank", "symbol", "name", "best_style", "style_state", "final_score",
-        "signal_score", "market_strength", "data_integrity_score", "confidence_position_multiplier",
+        "base_signal_score", "signal_score", "style_momentum_score", "breadth_score",
+        "style_rotation_bonus", "style_retreat_penalty", "retreat_risk",
+        "market_strength", "data_integrity_score", "confidence_position_multiplier",
         "candidate_data_source", "candidate_latest_date", "is_expected_trade_date",
         "data_source_name", "fallback_source_used", "source_attempts_summary",
         "close_price", "trigger_price", "suggested_lots", "suggested_shares", "estimated_amount",
@@ -160,6 +162,13 @@ def write_reports(
         "",
         _markdown_table(settings.get("data_quality_summary", []), ["数据模块", "状态", "说明"]),
         "",
+        "## 性能摘要",
+        "",
+        _markdown_table(
+            [settings.get("performance_summary", {})],
+            ["fetch_count", "indicator_compute_count", "index_indicator_compute_count", "snapshot_count", "valid_snapshot_count", "data_issue_count", "no_duplicate_io"],
+        ),
+        "",
         _reason_list("trading_critical_reasons", settings.get("trading_critical_reasons", [])),
         "",
         _reason_list("non_critical_warnings", settings.get("non_critical_warnings", [])),
@@ -179,7 +188,7 @@ def write_reports(
         "",
         _markdown_table(
             market.get("style_state_table", []),
-            ["style", "display_name", "state", "sample_size", "state_confidence", "cache_count", "cache_ratio", "failed_count", "failed_ratio", "sample_quality_eligible", "strongest_eligible", "above_ma20_ratio", "above_ma60_ratio", "rs_positive_ratio", "macd_bull_ratio"],
+            ["style", "display_name", "state", "sample_size", "state_confidence", "cache_count", "cache_ratio", "failed_count", "failed_ratio", "sample_quality_eligible", "strongest_eligible", "above_ma20_ratio", "above_ma60_ratio", "rs_positive_ratio", "macd_bull_ratio", "breadth_score", "style_momentum_score", "style_rotation_bonus", "style_retreat_penalty", "retreat_risk", "retreat_ratio"],
         ),
         "",
         "### portfolio_mode",
@@ -205,7 +214,7 @@ def write_reports(
         "",
         _markdown_table(
             watchlist,
-            ["symbol", "name", "best_style", "style_state", "final_score", "signal_score", "market_strength", "data_integrity_score", "close_price", "candidate_data_source", "candidate_latest_date", "is_expected_trade_date", "data_source_name", "fallback_source_used", "source_attempts_summary", "review_scope", "reason", "risk_note", "original_candidate_rank", "original_reason", "downgrade_reason", "original_account_risk_pct", "mode_account_risk_limit", "account_risk_pass", "original_estimated_amount"],
+            ["symbol", "name", "best_style", "style_state", "final_score", "base_signal_score", "signal_score", "style_momentum_score", "breadth_score", "style_rotation_bonus", "style_retreat_penalty", "retreat_risk", "market_strength", "data_integrity_score", "close_price", "candidate_data_source", "candidate_latest_date", "is_expected_trade_date", "data_source_name", "fallback_source_used", "source_attempts_summary", "review_scope", "reason", "risk_note", "original_candidate_rank", "original_reason", "downgrade_reason", "original_account_risk_pct", "mode_account_risk_limit", "account_risk_pass", "original_estimated_amount"],
         ),
         "",
         "## 数据问题名单 data_issue_list",

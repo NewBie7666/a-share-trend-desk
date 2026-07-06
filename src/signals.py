@@ -4,6 +4,7 @@ import pandas as pd
 
 from .position_rules import candidate_min_score, get_position_rule
 from .scoring import score_stock
+from .snapshots import snapshot_fetch_results, snapshot_filter_reasons, snapshot_names, snapshots_to_frames
 from .styles import STYLE_DISPLAY_NAMES
 from .utils import round_price
 
@@ -52,7 +53,13 @@ def build_condition_order(candidate: dict, settings: dict, rules: dict, rank: in
         "name": candidate["name"],
         "rank": rank,
         "score": candidate["score"],
+        "base_signal_score": candidate.get("base_signal_score", candidate.get("score")),
         "signal_score": candidate.get("signal_score", candidate["score"]),
+        "style_momentum_score": candidate.get("style_momentum_score", ""),
+        "breadth_score": candidate.get("breadth_score", ""),
+        "style_rotation_bonus": candidate.get("style_rotation_bonus", ""),
+        "style_retreat_penalty": candidate.get("style_retreat_penalty", ""),
+        "retreat_risk": candidate.get("retreat_risk", False),
         "market_strength": candidate.get("market_strength", 0),
         "data_integrity_score": candidate.get("data_integrity_score", 1.0),
         "confidence_position_multiplier": candidate.get("confidence_position_multiplier", 1.0),
@@ -183,6 +190,7 @@ def _ranked_candidates(
     filter_reasons: dict[str, list[str]],
     market: dict,
     settings: dict | None = None,
+    scores_by_symbol: dict[str, dict] | None = None,
 ) -> list[dict]:
     passed = []
     settings = settings or {}
@@ -195,6 +203,7 @@ def _ranked_candidates(
     data_integrity_score = float(integrity.get("data_integrity_score", settings.get("data_integrity_score", 1.0)) or 0)
     confidence_multiplier = float(integrity.get("confidence_position_multiplier", settings.get("confidence_position_multiplier", 1.0)) or 1.0)
     style_state_by_style = {row["style"]: row["state"] for row in market.get("style_state_table", [])}
+    style_metrics_by_style = {row["style"]: row for row in market.get("style_state_table", [])}
     strongest_styles = {
         style.strip()
         for style in str(market.get("portfolio_mode", {}).get("strongest_styles", "")).split(",")
@@ -203,18 +212,47 @@ def _ranked_candidates(
     for symbol, df in stock_frames.items():
         if filter_reasons.get(symbol):
             continue
-        item = score_stock(symbol, names.get(symbol, ""), df)
-        signal_score = float(item.get("score", 0) or 0)
+        item = (scores_by_symbol or {}).get(symbol)
+        if item is None:
+            item = score_stock(symbol, names.get(symbol, ""), df)
+        else:
+            item = item.copy()
+        base_signal_score = float(item.get("score", 0) or 0)
+        style = item.get("best_style", "other")
+        style_metrics = style_metrics_by_style.get(style, {})
+        style_momentum_score = float(style_metrics.get("style_momentum_score", base_signal_score) or 0)
+        breadth_score = float(style_metrics.get("breadth_score", style_momentum_score) or 0)
+        rotation_bonus = float(style_metrics.get("style_rotation_bonus", 0) or 0)
+        retreat_penalty = float(style_metrics.get("style_retreat_penalty", 0) or 0)
+        signal_score = (
+            base_signal_score * 0.50
+            + style_momentum_score * 0.25
+            + breadth_score * 0.15
+            + data_integrity_score * 100.0 * 0.10
+            + rotation_bonus
+            - retreat_penalty
+        )
+        signal_score = max(0.0, min(100.0, signal_score))
         final_score = signal_score * signal_weight + market_strength * market_weight + (data_integrity_score * 100.0) * integrity_weight
+        item["base_signal_score"] = round(base_signal_score, 2)
         item["signal_score"] = round(signal_score, 2)
+        item["style_momentum_score"] = round(style_momentum_score, 2)
+        item["breadth_score"] = round(breadth_score, 2)
+        item["style_rotation_bonus"] = round(rotation_bonus, 2)
+        item["style_retreat_penalty"] = round(retreat_penalty, 2)
+        item["retreat_risk"] = bool(style_metrics.get("retreat_risk", False))
         item["market_strength"] = round(market_strength, 2)
         item["data_integrity_score"] = round(data_integrity_score, 4)
         item["confidence_position_multiplier"] = confidence_multiplier
         item["final_score"] = round(final_score, 2)
-        style = item.get("best_style", "other")
         if style in style_state_by_style:
             item["style_state"] = style_state_by_style[style]
             item["reason"] = _style_state_reason(style, item["style_state"])
+        if item.get("retreat_risk"):
+            item["reason"] = f"{item.get('reason', '')}；所属风格出现退潮风险，已扣减信号分"
+            item["risk_note"] = f"{item.get('risk_note', '')}；风格扩散度下降或样本转弱，高分个股也不宜追高"
+        elif rotation_bonus > 0:
+            item["reason"] = f"{item.get('reason', '')}；所属风格出现扩散转强，获得风格启动加分"
         passed.append(item)
     return sorted(
         passed,
@@ -235,10 +273,11 @@ def generate_buy_signals(
     holdings: pd.DataFrame | None = None,
     data_quality_level: str = "fresh",
     fetch_results_by_symbol: dict | None = None,
+    scores_by_symbol: dict[str, dict] | None = None,
 ) -> dict:
     forbidden = categorize_forbidden(filter_reasons, names)
     data_issue_list = _data_issue_list(fetch_results_by_symbol, names)
-    ranked = _ranked_candidates(stock_frames, names, filter_reasons, market, settings)
+    ranked = _ranked_candidates(stock_frames, names, filter_reasons, market, settings, scores_by_symbol)
     style_state_by_style = {row["style"]: row["state"] for row in market.get("style_state_table", [])}
     has_style_state_table = "style_state_table" in market
     strongest_styles = {
@@ -399,6 +438,33 @@ def generate_buy_signals(
     }
 
 
+def generate_buy_signals_from_snapshots(
+    market: dict,
+    snapshots_by_symbol: dict,
+    settings: dict,
+    rules: dict,
+    holdings: pd.DataFrame | None = None,
+    data_quality_level: str = "fresh",
+) -> dict:
+    scores_by_symbol = {
+        symbol: snapshot.score
+        for symbol, snapshot in snapshots_by_symbol.items()
+        if getattr(snapshot, "score", None) is not None
+    }
+    return generate_buy_signals(
+        market,
+        snapshots_to_frames(snapshots_by_symbol),
+        snapshot_names(snapshots_by_symbol),
+        snapshot_filter_reasons(snapshots_by_symbol),
+        settings,
+        rules,
+        holdings,
+        data_quality_level,
+        snapshot_fetch_results(snapshots_by_symbol),
+        scores_by_symbol,
+    )
+
+
 def categorize_forbidden(filter_reasons: dict[str, list[str]], names: dict[str, str]) -> dict[str, dict]:
     categories = {
         "overheated": {"rows": [], "extra_count": 0},
@@ -482,6 +548,22 @@ def evaluate_holdings(
             }
         )
     return actions
+
+
+def evaluate_holdings_from_snapshots(
+    holdings: pd.DataFrame,
+    snapshots_by_symbol: dict,
+    market: dict,
+    settings: dict,
+    rules: dict,
+) -> list[dict]:
+    return evaluate_holdings(
+        holdings,
+        snapshots_to_frames(snapshots_by_symbol),
+        market,
+        settings,
+        rules,
+    )
 
 
 def _is_large_bearish_volume(row: pd.Series) -> bool:
