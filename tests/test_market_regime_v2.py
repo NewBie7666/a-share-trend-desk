@@ -280,3 +280,127 @@ def test_runtime_profile_fast_is_applied():
     assert loaded["data_fetch"]["batch_size"] == 30
     assert loaded["data_fetch"]["batch_pause_seconds"] == 3
     assert loaded["data_fetch"]["max_retries"] == 2
+
+
+
+def test_final_trade_decision_missing_inputs_are_audited():
+    missing_market = make_final_trade_decision("", {"timing_decision": "BUY"})
+    assert missing_market["final_action"] == "WAIT"
+    assert missing_market["decision_source"] == "missing_input"
+    assert "market_regime" in missing_market["final_reason"][0]
+
+    missing_timing = make_final_trade_decision("normal", {})
+    assert missing_timing["final_action"] == "WAIT"
+    assert missing_timing["decision_source"] == "missing_input"
+    assert "timing_decision" in missing_timing["final_reason"][0]
+
+    assert make_final_trade_decision("cash", {"timing_decision": "BUY"})["decision_source"] == "market_block"
+    assert make_final_trade_decision("normal", {"timing_decision": "WAIT"})["decision_source"] == "timing_block"
+    assert make_final_trade_decision("normal", {"timing_decision": "BUY"})["decision_source"] == "normal_decision"
+
+
+def test_missing_market_regime_and_timing_do_not_default_to_buy():
+    timing = {"600030": {"timing_decision": "BUY", "structure_state": "breakout", "entry_quality_score": 82, "decision_confidence": 0.85}}
+    no_market = market("normal")
+    no_market.pop("market_regime")
+    missing_market = generate_buy_signals(
+        no_market,
+        {"600030": frame()},
+        {"600030": "broker"},
+        {"600030": []},
+        settings(),
+        RULES,
+        timing_by_symbol=timing,
+    )
+    assert missing_market["candidates"] == []
+    assert missing_market["watchlist"][0]["review_scope"] == "timing_review"
+    assert "market_regime" in missing_market["watchlist"][0]["downgrade_reason"]
+
+    missing_timing = generate_buy_signals(
+        market("normal"),
+        {"600030": frame()},
+        {"600030": "broker"},
+        {"600030": []},
+        settings(),
+        RULES,
+    )
+    assert missing_timing["candidates"] == []
+    assert missing_timing["watchlist"][0]["review_scope"] == "timing_review"
+    assert "timing_decision" in missing_timing["watchlist"][0]["downgrade_reason"]
+
+
+def test_missing_final_action_from_decision_is_downgraded(monkeypatch):
+    timing = {"600030": {"timing_decision": "BUY", "structure_state": "breakout", "entry_quality_score": 82, "decision_confidence": 0.85}}
+    monkeypatch.setattr("src.signals.make_final_trade_decision", lambda *args, **kwargs: {"final_reason": ["missing final_action"], "position_multiplier": 0.0})
+    signals = generate_buy_signals(
+        market("normal"),
+        {"600030": frame()},
+        {"600030": "broker"},
+        {"600030": []},
+        settings(),
+        RULES,
+        timing_by_symbol=timing,
+    )
+    assert signals["candidates"] == []
+    assert signals["watchlist"][0]["review_scope"] == "timing_review"
+    assert "final_action" in signals["watchlist"][0]["downgrade_reason"]
+
+
+def test_structured_blocker_permission_reason_includes_source_codes_and_severity():
+    timing = {"600030": {"timing_decision": "BUY", "structure_state": "breakout", "entry_quality_score": 82, "decision_confidence": 0.85}}
+    cfg = settings()
+    cfg["data_quality_level"] = "critical_cache"
+    cfg["trading_critical_blocker_codes"] = ["core_index_unavailable"]
+    signals = generate_buy_signals(
+        market("normal"),
+        {"600030": frame()},
+        {"600030": "broker"},
+        {"600030": []},
+        cfg,
+        RULES,
+        timing_by_symbol=timing,
+        data_quality_level="critical_cache",
+    )
+    reason = "?".join(signals["final_trade_permission_reason"])
+    assert signals["candidates"] == []
+    assert "blocker_source=structured_code" in reason
+    assert "core_index_unavailable" in reason
+    assert "blocker_severity=block_new_position" in reason
+    assert signals["watchlist"][0]["final_trade_permission"] == signals["final_trade_permission"]
+
+
+def test_low_score_watchlist_keeps_minimum_score_and_audit_fields():
+    timing = {"600030": {"timing_decision": "BUY", "structure_state": "breakout", "entry_quality_score": 82, "decision_confidence": 0.85}}
+    score = {
+        "symbol": "600030",
+        "name": "broker",
+        "score": 40,
+        "final_score": 40,
+        "best_style": "finance_brokerage",
+        "style_state": "strong",
+        "style_scores": {},
+        "close_price": 20,
+        "ma20": 19,
+        "ma60": 18,
+        "reason": "low score sample",
+        "risk_note": "test",
+    }
+    signals = generate_buy_signals(
+        market("normal"),
+        {"600030": frame()},
+        {"600030": "broker"},
+        {"600030": []},
+        settings(),
+        RULES,
+        scores_by_symbol={"600030": score},
+        timing_by_symbol=timing,
+    )
+    row = signals["watchlist"][0]
+    assert signals["candidates"] == []
+    assert row["minimum_score"] == 70
+    assert row["portfolio_mode"] == "balanced"
+    assert row["market_regime"] == "normal"
+    assert row["timing_decision"] == "BUY"
+    assert "final_score=" in row["downgrade_reason"]
+    assert "final_score=" in row["downgrade_reason"]
+    assert row["final_trade_permission"] == signals["final_trade_permission"]

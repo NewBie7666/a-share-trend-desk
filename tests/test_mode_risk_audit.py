@@ -54,11 +54,27 @@ def settings():
     }
 
 
+def buy_timing(*symbols):
+    return {
+        symbol: {
+            "timing_decision": "BUY",
+            "structure_state": "breakout",
+            "entry_quality_score": 82,
+            "decision_confidence": 0.85,
+            "timing_reason": "????",
+            "trend_strong": True,
+            "timing_risk_tag": "",
+        }
+        for symbol in symbols
+    }
+
+
 def market(mode, style="finance_brokerage"):
     return {
         "state": "green",
         "portfolio_mode": {"portfolio_mode": mode, "strongest_styles": style},
         "market_state": "bull",
+        "market_regime": {"attack": "attack", "balanced": "normal", "defensive": "defensive", "cash": "cash"}.get(mode, "normal"),
         "market_strength": 85,
         "style_state_table": [{"style": style, "state": "strong", "sample_size": 5}],
     }
@@ -78,7 +94,9 @@ def fetch(symbol, source="fresh", expected=True):
 
 
 def test_mode_account_risk_limits_are_applied_by_mode():
-    defensive = generate_buy_signals(market("defensive"), {"600030": frame(ma60=18)}, {"600030": "broker"}, {"600030": []}, settings(), RULES)
+    defensive_market = market("defensive")
+    defensive_market["market_regime"] = "normal"
+    defensive = generate_buy_signals(defensive_market, {"600030": frame(ma60=18)}, {"600030": "broker"}, {"600030": []}, settings(), RULES, timing_by_symbol=buy_timing("600030"))
     assert defensive["candidates"] == []
     risk_row = defensive["watchlist"][0]
     assert risk_row["review_scope"] == "candidate_risk_review"
@@ -87,17 +105,17 @@ def test_mode_account_risk_limits_are_applied_by_mode():
     assert risk_row["original_account_risk_pct"] > 0.015
     assert risk_row["downgrade_reason"]
 
-    balanced = generate_buy_signals(market("balanced"), {"600030": frame(ma60=18)}, {"600030": "broker"}, {"600030": []}, settings(), RULES)
+    balanced = generate_buy_signals(market("balanced"), {"600030": frame(ma60=18)}, {"600030": "broker"}, {"600030": []}, settings(), RULES, timing_by_symbol=buy_timing("600030"))
     assert balanced["candidates"][0]["mode_account_risk_limit"] == 0.025
     assert balanced["candidates"][0]["account_risk_pass"] is True
 
-    attack = generate_buy_signals(market("attack"), {"600030": frame(ma60=18.5)}, {"600030": "broker"}, {"600030": []}, settings(), RULES)
+    attack = generate_buy_signals(market("attack"), {"600030": frame(ma60=18.5)}, {"600030": "broker"}, {"600030": []}, settings(), RULES, timing_by_symbol=buy_timing("600030"))
     assert attack["candidates"][0]["mode_account_risk_limit"] == 0.030
     assert attack["candidates"][0]["account_risk_pass"] is True
 
 
 def test_cash_mode_has_no_formal_candidate():
-    signals = generate_buy_signals(market("cash"), {"600030": frame()}, {"600030": "broker"}, {"600030": []}, settings(), RULES)
+    signals = generate_buy_signals(market("cash"), {"600030": frame()}, {"600030": "broker"}, {"600030": []}, settings(), RULES, timing_by_symbol=buy_timing("600030"))
     assert signals["candidates"] == []
 
 
@@ -109,6 +127,7 @@ def test_observation_rows_have_nonblank_source_audit_fields():
         {"600030": [], "601211": []},
         settings(),
         RULES,
+        timing_by_symbol=buy_timing("600030", "601211"),
     )
     ordinary = signals["watchlist"][0]
     assert ordinary["candidate_data_source"] == "not_reviewed"
@@ -126,6 +145,7 @@ def test_cache_candidate_is_downgraded_with_source_scope_and_fields():
         settings(),
         RULES,
         fetch_results_by_symbol={"600030": fetch("600030", source="cache")},
+        timing_by_symbol=buy_timing("600030"),
     )
     assert signals["candidates"] == []
     row = signals["watchlist"][0]
@@ -169,6 +189,7 @@ def test_defensive_trend_candidate_has_small_probe_note(monkeypatch):
         settings(),
         RULES,
         fetch_results_by_symbol={"600522": fetch("600522")},
+        timing_by_symbol=buy_timing("600522"),
     )
     assert signals["candidates"]
     assert "小仓位试探，不代表进攻仓" in signals["candidates"][0]["risk_note"]

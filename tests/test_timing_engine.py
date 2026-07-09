@@ -112,6 +112,7 @@ def market() -> dict:
     return {
         "state": "yellow",
         "market_state": "neutral",
+        "market_regime": "normal",
         "market_strength": 60,
         "style_state_table": [{"style": "finance_brokerage", "state": "strong"}],
         "portfolio_mode": {"portfolio_mode": "balanced", "strongest_styles": "finance_brokerage", "potential_strong_styles": "无"},

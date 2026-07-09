@@ -72,6 +72,21 @@ def frame(close=20, ma20=None, ma60=None, slope=0.01, rs=0.06, amount=800_000_00
     )
 
 
+def buy_timing(*symbols):
+    return {
+        symbol: {
+            "timing_decision": "BUY",
+            "structure_state": "breakout",
+            "entry_quality_score": 82,
+            "decision_confidence": 0.85,
+            "timing_reason": "????",
+            "trend_strong": True,
+            "timing_risk_tag": "",
+        }
+        for symbol in symbols
+    }
+
+
 def index_row(code, state="strong"):
     values = {
         "strong": (100, 95, 90),
@@ -129,7 +144,7 @@ def test_partial_or_critical_cache_does_not_change_portfolio_mode():
 
 
 def test_same_style_allows_only_one_candidate():
-    market = {"state": "green", "market_state": "bull", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "max_total_position": 0.80, "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+    market = {"state": "green", "market_state": "bull", "market_regime": "attack", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "max_total_position": 0.80, "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
     signals = generate_buy_signals(
         market,
         {"600030": frame(20), "601211": frame(18)},
@@ -137,6 +152,7 @@ def test_same_style_allows_only_one_candidate():
         {"600030": [], "601211": []},
         settings(),
         RULES,
+        timing_by_symbol=buy_timing("600030", "601211"),
     )
     assert len(signals["candidates"]) == 1
     assert signals["candidates"][0]["best_style"] == "finance_brokerage"
@@ -181,9 +197,9 @@ def test_bear_market_generates_no_new_candidate():
 
 
 def test_data_integrity_score_changes_final_score_and_position_amount():
-    market = {"state": "green", "market_state": "bull", "market_strength": 80, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+    market = {"state": "green", "market_state": "bull", "market_regime": "attack", "market_strength": 80, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
     low_integrity_settings = settings({"data_integrity_report": {"data_integrity_score": 0.5, "confidence_position_multiplier": 0.4}})
-    signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, low_integrity_settings, RULES)
+    signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, low_integrity_settings, RULES, timing_by_symbol=buy_timing("600030"))
     candidate = signals["candidates"][0]
     assert candidate["data_integrity_score"] == 0.5
     assert candidate["confidence_position_multiplier"] == 0.4
@@ -191,8 +207,8 @@ def test_data_integrity_score_changes_final_score_and_position_amount():
 
 
 def test_critical_cache_no_longer_globally_downgrades_candidate():
-    market = {"state": "green", "market_state": "bull", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "balanced", "max_total_position": 0.50, "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
-    signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, data_quality_level="critical_cache")
+    market = {"state": "green", "market_state": "bull", "market_regime": "attack", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "balanced", "max_total_position": 0.50, "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+    signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, data_quality_level="critical_cache", timing_by_symbol=buy_timing("600030"))
     assert len(signals["candidates"]) == 1
     assert signals["candidates"][0]["symbol"] == "600030"
 

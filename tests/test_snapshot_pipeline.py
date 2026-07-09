@@ -88,6 +88,7 @@ def market() -> dict:
     return {
         "state": "yellow",
         "market_state": "neutral",
+        "market_regime": "normal",
         "market_strength": 60,
         "style_state_table": [{"style": "finance_brokerage", "state": "strong"}],
         "portfolio_mode": {
@@ -162,6 +163,15 @@ def test_style_and_signal_stages_do_not_fetch(monkeypatch):
         },
         style="finance_brokerage",
         style_state="strong",
+        timing={
+            "timing_decision": "BUY",
+            "structure_state": "breakout",
+            "entry_quality_score": 82,
+            "decision_confidence": 0.85,
+            "timing_reason": "买点通过",
+            "trend_strong": True,
+            "timing_risk_tag": "",
+        },
     )
     snapshots = {"600030": snapshot}
 

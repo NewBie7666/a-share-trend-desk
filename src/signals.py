@@ -197,6 +197,7 @@ def _normalize_observation(item: dict) -> dict:
     out.setdefault("final_action", "")
     out.setdefault("position_multiplier", "")
     out.setdefault("final_reason", "")
+    out.setdefault("decision_source", "")
     out.setdefault("market_regime", "")
     out.setdefault("market_score", "")
     out.setdefault("portfolio_mode", "")
@@ -204,6 +205,9 @@ def _normalize_observation(item: dict) -> dict:
     out.setdefault("raw_portfolio_mode", "")
     out.setdefault("volume", "")
     out.setdefault("amount", "")
+    out.setdefault("minimum_score", "")
+    out.setdefault("final_trade_permission", "")
+    out.setdefault("final_trade_permission_reason", "")
     return out
 
 
@@ -229,6 +233,7 @@ def _apply_final_decision_fields(item: dict, decision: dict, market: dict) -> di
     item["final_action"] = decision.get("final_action", "")
     item["position_multiplier"] = decision.get("position_multiplier", "")
     item["final_reason"] = "；".join(str(reason) for reason in decision.get("final_reason", []) if reason)
+    item["decision_source"] = decision.get("decision_source", "")
     item["market_regime"] = market.get("market_regime", "")
     item["market_score"] = market.get("market_score", "")
     item["portfolio_mode"] = portfolio.get("portfolio_mode", "")
@@ -239,30 +244,47 @@ def _apply_final_decision_fields(item: dict, decision: dict, market: dict) -> di
 
 def classify_trading_critical_blockers(settings: dict) -> dict:
     reasons = [str(item) for item in settings.get("trading_critical_reasons", []) or []]
-    codes = [str(code) for code in (settings.get("trading_critical_blocker_codes", []) or [])]
+    structured_codes = [str(code) for code in (settings.get("trading_critical_blocker_codes", []) or []) if code]
+    fallback_codes: list[str] = []
     if settings.get("trade_calendar_status") == "failed":
-        codes.append("trade_calendar_failed")
+        structured_codes.append("trade_calendar_failed")
     if settings.get("stock_basic_is_trading_critical"):
-        codes.append("stock_basic_trading_critical")
+        structured_codes.append("stock_basic_trading_critical")
     if settings.get("data_quality_level") == "stale":
-        codes.append("stale_data")
-    text = "；".join(reasons)
-    keyword_map = {
-        "core_index_unavailable": ["核心指数", "core index", "000300", "000001", "399001"],
-        "trade_calendar_failed": ["交易日历失败", "trade calendar failed"],
-        "stock_basic_trading_critical": ["ST/退市", "主板范围无法判断", "股票基础信息为交易关键异常", "stock basic"],
-        "market_state_unknown": ["市场状态不可判定", "market_state unknown", "market state unknown"],
-        "broad_daily_data_failure": ["大面积个股日线异常", "大量缓存回退", "broad daily", "too many"],
-        "stale_data": ["数据陈旧", "stale"],
-    }
-    for code, keywords in keyword_map.items():
-        if any(keyword in text for keyword in keywords):
-            codes.append(code)
+        structured_codes.append("stale_data")
+
+    if not structured_codes:
+        text = "?".join(reasons)
+        keyword_map = {
+            "core_index_unavailable": ["核心指数", "core index", "000300", "000001", "399001"],
+            "trade_calendar_failed": ["交易日历失败", "trade calendar failed"],
+            "stock_basic_trading_critical": ["ST/退市", "主板范围无法判断", "股票基础信息为交易关键异常", "stock basic"],
+            "market_state_unknown": ["市场状态不可判定", "market_state unknown", "market state unknown"],
+            "broad_daily_data_failure": ["大面积个股日线异常", "大量缓存回退", "broad daily", "too many"],
+            "stale_data": ["数据陈旧", "stale"],
+        }
+        for code, keywords in keyword_map.items():
+            if any(keyword in text for keyword in keywords):
+                fallback_codes.append(code)
+
+    if structured_codes:
+        blocker_source = "structured_code"
+        codes = structured_codes
+    elif fallback_codes:
+        blocker_source = "fallback_keyword"
+        codes = fallback_codes
+    else:
+        blocker_source = "none"
+        codes = []
+
     unique_codes = sorted(set(code for code in codes if code))
+    blocked = bool(unique_codes) and settings.get("data_quality_level") in {"critical_cache", "stale"}
     return {
-        "blocked": bool(unique_codes) and settings.get("data_quality_level") in {"critical_cache", "stale"},
+        "blocked": blocked,
         "blocker_codes": unique_codes,
         "blocker_reasons": reasons,
+        "blocker_source": blocker_source,
+        "blocker_severity": "block_new_position" if blocked else "warning" if unique_codes else "none",
     }
 
 
@@ -270,20 +292,36 @@ def validate_pre_order_candidate(candidate: dict, market: dict, source_fields: d
     reasons: list[str] = []
     portfolio = market.get("portfolio_mode", {}) or {}
     portfolio_mode = portfolio.get("portfolio_mode", "cash")
-    market_regime = market.get("market_regime") or {"attack": "attack", "balanced": "normal", "defensive": "defensive", "cash": "cash"}.get(portfolio_mode, "cash")
+    market_regime = market.get("market_regime")
     expected_date = settings.get("expected_trade_date", "")
+    timing_decision = candidate.get("timing_decision")
+    final_action = candidate.get("final_action")
+    data_source = source_fields.get("candidate_data_source")
+    latest_date = source_fields.get("candidate_latest_date")
+
     if portfolio_mode == "cash":
         reasons.append("组合模式为 cash，禁止正式新开仓")
-    if market_regime == "cash":
+    if not market_regime:
+        reasons.append("缺少 market_regime，不能进入正式候选")
+    elif market_regime == "cash":
         reasons.append("市场环境为 cash，禁止正式新开仓")
-    if candidate.get("timing_decision") != "BUY":
-        reasons.append("交易时机不是 BUY")
-    if candidate.get("final_action") != "BUY":
-        reasons.append("最终裁决不是 BUY")
-    if source_fields.get("candidate_data_source") != "fresh":
-        reasons.append("正式候选必须使用 fresh 行情数据")
-    if expected_date and source_fields.get("candidate_latest_date") != expected_date:
-        reasons.append("候选有效行情日期不是预期交易日")
+    if not timing_decision:
+        reasons.append("缺少 timing_decision，不能进入正式候选")
+    elif timing_decision != "BUY":
+        reasons.append("timing_decision 不是 BUY")
+    if not final_action:
+        reasons.append("缺少 final_action，不能进入正式候选")
+    elif final_action != "BUY":
+        reasons.append("final_action 不是 BUY")
+    if not data_source:
+        reasons.append("缺少 candidate_data_source，不能进入正式候选")
+    elif data_source != "fresh":
+        reasons.append("candidate_data_source 不是 fresh")
+    if expected_date:
+        if not latest_date:
+            reasons.append("缺少 candidate_latest_date，不能进入正式候选")
+        elif latest_date != expected_date:
+            reasons.append("candidate_latest_date 不是预期交易日")
     if not source_fields.get("is_expected_trade_date"):
         reasons.append("候选行情未通过预期交易日校验")
     if not volume_check.get("has_trading_volume"):
@@ -328,19 +366,42 @@ def _candidate_review_row(candidate: dict, *, review_scope: str, downgrade_reaso
     row["original_score"] = candidate.get("score")
     row["original_final_score"] = candidate.get("final_score")
     row["original_reason"] = candidate.get("reason", "")
-    row["downgrade_reason"] = "；".join(reason for reason in downgrade_reasons if reason)
-    row["reason"] = f"{candidate.get('reason', '')}；{row['downgrade_reason']}"
+    row["downgrade_reason"] = "?".join(reason for reason in downgrade_reasons if reason)
+    row["reason"] = f"{candidate.get('reason', '')}?{row['downgrade_reason']}"
+    row["market_regime"] = row.get("market_regime") or (market or {}).get("market_regime", "")
+    row["market_score"] = row.get("market_score") or (market or {}).get("market_score", "")
     row["portfolio_mode"] = row.get("portfolio_mode") or portfolio.get("portfolio_mode", "")
     row["final_portfolio_mode"] = row.get("final_portfolio_mode") or portfolio.get("final_portfolio_mode", portfolio.get("portfolio_mode", ""))
     row["raw_portfolio_mode"] = row.get("raw_portfolio_mode") or portfolio.get("raw_portfolio_mode", portfolio.get("portfolio_mode", ""))
     return row
 
 
+def _add_trade_permission_to_rows(rows: list[dict], permission: dict) -> list[dict]:
+    for row in rows:
+        row["final_trade_permission"] = permission.get("final_trade_permission", "")
+        row["final_trade_permission_reason"] = "；".join(str(item) for item in permission.get("final_trade_permission_reason", []) if item)
+    return rows
+
+
+def _finalize_signal_result(result: dict, market: dict, settings: dict) -> dict:
+    permission = build_final_trade_permission(market, result, settings)
+    result.update(permission)
+    result["watchlist"] = _add_trade_permission_to_rows(result.get("watchlist", []), permission)
+    result["timing_avoid_list"] = _add_trade_permission_to_rows(result.get("timing_avoid_list", []), permission)
+    return result
+
+
 def build_final_trade_permission(market: dict, signals: dict, settings: dict) -> dict:
     blocker = classify_trading_critical_blockers(settings)
     portfolio = market.get("portfolio_mode", {}) or {}
     if blocker["blocked"]:
-        return {"final_trade_permission": "数据不支持正式新开仓", "final_trade_permission_reason": blocker["blocker_reasons"] or blocker["blocker_codes"]}
+        reason = [
+            f"blocker_source={blocker['blocker_source']}",
+            f"blocker_codes={','.join(blocker['blocker_codes']) or 'none'}",
+            f"blocker_severity={blocker['blocker_severity']}",
+        ]
+        reason.extend(blocker["blocker_reasons"])
+        return {"final_trade_permission": "数据不支持正式新开仓", "final_trade_permission_reason": reason}
     if market.get("market_regime") == "cash":
         return {"final_trade_permission": "市场环境禁止新开仓", "final_trade_permission_reason": ["market_regime=cash"]}
     if portfolio.get("portfolio_mode") == "cash":
@@ -476,15 +537,11 @@ def generate_buy_signals(
     market_state = market.get("market_state") or {"green": "bull", "yellow": "neutral", "red": "bear"}.get(market.get("state"), "unknown")
     if market_state in {"bear", "unknown"}:
         result = {"candidates": [], "watchlist": [_normalize_observation(item) for item in ranked[:5]], "forbidden": forbidden, "data_issue_list": data_issue_list}
-        result.update(build_final_trade_permission(market, result, settings))
-        return result
+        return _finalize_signal_result(result, market, settings)
 
     portfolio_mode = market.get("portfolio_mode", {}).get("portfolio_mode", "cash")
     effective_portfolio_mode = portfolio_mode
     market_regime = market.get("market_regime")
-    final_decision_enabled = bool(market_regime) or bool(timing_by_symbol)
-    if not market_regime:
-        market_regime = {"attack": "attack", "balanced": "normal", "defensive": "defensive", "cash": "cash"}.get(portfolio_mode, "cash")
     rule = get_position_rule(settings, effective_portfolio_mode)
     max_candidates = int(rule["max_new_candidates"])
     max_total_position = float(rule["max_total_position"])
@@ -502,8 +559,7 @@ def generate_buy_signals(
             copied["reason"] = f"{item['reason']}\uff1b\u65b0\u5f00\u4ed3\u53ef\u7528\u989d\u5ea6\u4e0d\u8db3"
             watch.append(copied)
         result = {"candidates": [], "watchlist": [_normalize_observation(item) for item in watch], "forbidden": forbidden, "style_explanations": [], "data_issue_list": data_issue_list}
-        result.update(build_final_trade_permission(market, result, settings))
-        return result
+        return _finalize_signal_result(result, market, settings)
 
     selected = []
     watchlist = []
@@ -524,8 +580,7 @@ def generate_buy_signals(
             for item in ranked[:8]
         ]
         result = {"candidates": [], "watchlist": [_normalize_observation(item) for item in watch], "forbidden": forbidden, "style_explanations": [], "data_issue_list": data_issue_list, "timing_avoid_list": []}
-        result.update(build_final_trade_permission(market, result, settings))
-        return result
+        return _finalize_signal_result(result, market, settings)
 
     for candidate in ranked:
         if len(selected) >= max_candidates:
@@ -551,42 +606,63 @@ def generate_buy_signals(
         minimum_score = candidate_min_score(effective_portfolio_mode, style_state, settings)
         if candidate["final_score"] < minimum_score:
             item = candidate.copy()
-            item["reason"] = f"{candidate['reason']}\uff1b\u5f53\u524d {portfolio_mode} \u6a21\u5f0f\u6700\u4f4e\u5206\u8981\u6c42\u4e3a {minimum_score:.0f}\uff0c\u5206\u6570\u4e0d\u8db3"
+            item["minimum_score"] = minimum_score
+            item["portfolio_mode"] = portfolio_mode
+            item["final_portfolio_mode"] = market.get("portfolio_mode", {}).get("final_portfolio_mode", portfolio_mode)
+            item["raw_portfolio_mode"] = market.get("portfolio_mode", {}).get("raw_portfolio_mode", portfolio_mode)
+            item["market_regime"] = market_regime or ""
+            item["market_score"] = market.get("market_score", "")
+            item["review_scope"] = "observation_only"
+            item["downgrade_reason"] = f"当前 {portfolio_mode} 模式最低分要求为 {minimum_score:.0f}，该股 final_score={candidate['final_score']:.2f}，分数不足"
+            item["reason"] = f"{candidate['reason']}?{item['downgrade_reason']}"
             watchlist.append(item)
             continue
-        if final_decision_enabled:
-            candidate = candidate.copy()
-            decision = make_final_trade_decision(market_regime, candidate)
-            _apply_final_decision_fields(candidate, decision, {**market, "market_regime": market_regime})
-            if decision.get("final_action") != "BUY":
-                item = candidate.copy()
-                item["review_scope"] = "timing_review"
-                item["original_reason"] = candidate.get("reason", "")
-                item["downgrade_reason"] = candidate.get("final_reason") or candidate.get("timing_reason", "最终交易裁决未达到BUY")
-                item["reason"] = f"{candidate.get('reason', '')}；最终裁决={decision.get('final_action')}，{item['downgrade_reason']}"
-                if decision.get("final_action") == "WAIT":
-                    watchlist.append(item)
-                else:
-                    timing_avoid_list.append(item)
-                continue
+        if not market_regime:
+            watchlist.append(
+                _candidate_review_row(
+                    candidate,
+                    review_scope="timing_review",
+                    downgrade_reasons=["缺少 market_regime，不能进入正式候选"],
+                    market=market,
+                )
+            )
+            continue
+        if not candidate.get("timing_decision"):
+            watchlist.append(
+                _candidate_review_row(
+                    candidate,
+                    review_scope="timing_review",
+                    downgrade_reasons=["缺少 timing_decision，不能进入正式候选"],
+                    market=market,
+                )
+            )
+            continue
 
-        timing_decision = candidate.get("timing_decision")
-        if not final_decision_enabled and timing_decision and timing_decision != "BUY":
-            item = candidate.copy()
-            item["review_scope"] = "timing_review"
-            item["original_reason"] = candidate.get("reason", "")
-            item["downgrade_reason"] = candidate.get("timing_reason", "交易时机未满足BUY条件")
-            item["reason"] = f"{candidate.get('reason', '')}；交易时机={timing_decision}，{item['downgrade_reason']}"
-            if timing_decision == "WAIT":
+        candidate = candidate.copy()
+        decision = make_final_trade_decision(market_regime, candidate)
+        _apply_final_decision_fields(candidate, decision, market)
+        if "final_action" not in decision:
+            watchlist.append(
+                _candidate_review_row(
+                    candidate,
+                    review_scope="timing_review",
+                    downgrade_reasons=["final decision 未返回 final_action，不能进入正式候选"],
+                    market=market,
+                )
+            )
+            continue
+        if decision.get("final_action") != "BUY":
+            item = _candidate_review_row(
+                candidate,
+                review_scope="timing_review",
+                downgrade_reasons=[candidate.get("final_reason") or candidate.get("timing_reason") or "最终交易裁决未达到 BUY"],
+                market=market,
+            )
+            if decision.get("final_action") == "WAIT":
                 watchlist.append(item)
             else:
                 timing_avoid_list.append(item)
             continue
-
-        if not final_decision_enabled:
-            candidate = candidate.copy()
-            candidate.setdefault("timing_decision", "BUY")
-            candidate.setdefault("final_action", "BUY")
 
         if style_counts.get(style, 0) >= max_same_style:
             item = candidate.copy()
@@ -658,8 +734,7 @@ def generate_buy_signals(
         "data_issue_list": data_issue_list,
         "timing_avoid_list": [_normalize_observation(item) for item in timing_avoid_list[:20]],
     }
-    result.update(build_final_trade_permission(market, result, settings))
-    return result
+    return _finalize_signal_result(result, market, settings)
 
 
 def generate_buy_signals_from_snapshots(

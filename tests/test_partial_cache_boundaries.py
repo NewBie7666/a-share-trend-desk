@@ -69,6 +69,21 @@ def settings(extra=None):
     return base
 
 
+def buy_timing(*symbols):
+    return {
+        symbol: {
+            "timing_decision": "BUY",
+            "structure_state": "breakout",
+            "entry_quality_score": 82,
+            "decision_confidence": 0.85,
+            "timing_reason": "????",
+            "trend_strong": True,
+            "timing_risk_tag": "",
+        }
+        for symbol in symbols
+    }
+
+
 def fetch(symbol, source="fresh", expected=True, empty=False):
     return FetchResult(
         symbol,
@@ -132,8 +147,8 @@ def test_partial_cache_does_not_degrade_portfolio_mode_in_v2():
 
 
 def test_formal_candidate_has_data_source_fields():
-    market = {"state": "green", "market_state": "bull", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
-    signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030")})
+    market = {"state": "green", "market_state": "bull", "market_regime": "attack", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+    signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030")}, timing_by_symbol=buy_timing("600030"))
     candidate = signals["candidates"][0]
     assert candidate["candidate_data_source"] == "fresh"
     assert candidate["candidate_latest_date"] == "2026-07-01"
@@ -141,27 +156,27 @@ def test_formal_candidate_has_data_source_fields():
 
 
 def test_candidate_cache_and_unexpected_date_are_downgraded():
-    market = {"state": "green", "market_state": "bull", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
-    signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030", source="cache")})
+    market = {"state": "green", "market_state": "bull", "market_regime": "attack", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+    signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030", source="cache")}, timing_by_symbol=buy_timing("600030"))
     assert signals["candidates"] == []
     assert signals["watchlist"][0]["candidate_data_source"] == "cache"
     assert signals["watchlist"][0]["review_scope"] == "candidate_data_review"
 
-    signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030", expected=False)})
+    signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030", expected=False)}, timing_by_symbol=buy_timing("600030"))
     assert signals["candidates"] == []
     assert signals["watchlist"][0]["is_expected_trade_date"] is False
 
 
 def test_zero_volume_or_amount_downgrades_candidate():
-    market = {"state": "green", "market_state": "bull", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
-    signals = generate_buy_signals(market, {"600030": frame(volume=0)}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030")})
+    market = {"state": "green", "market_state": "bull", "market_regime": "attack", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+    signals = generate_buy_signals(market, {"600030": frame(volume=0)}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030")}, timing_by_symbol=buy_timing("600030"))
     assert signals["candidates"] == []
     assert "成交量或成交额为0" in signals["watchlist"][0]["downgrade_reason"]
 
 
 def test_failed_source_enters_data_issue_list_and_not_candidate():
-    market = {"state": "green", "market_state": "bull", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
-    signals = generate_buy_signals(market, {"600030": pd.DataFrame()}, {"600030": "中信证券"}, {"600030": ["行情数据不可用于交易信号"]}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030", source="failed", empty=True)})
+    market = {"state": "green", "market_state": "bull", "market_regime": "attack", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+    signals = generate_buy_signals(market, {"600030": pd.DataFrame()}, {"600030": "中信证券"}, {"600030": ["行情数据不可用于交易信号"]}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030", source="failed", empty=True)}, timing_by_symbol=buy_timing("600030"))
     assert signals["candidates"] == []
     assert signals["watchlist"] == []
     assert signals["data_issue_list"][0]["symbol"] == "600030"

@@ -251,14 +251,14 @@ def write_reports(
         "",
         _markdown_table(
             watchlist,
-            ["symbol", "name", "best_style", "style_state", "final_score", "base_signal_score", "signal_score", "style_momentum_score", "breadth_score", "style_rotation_bonus", "style_retreat_penalty", "retreat_risk", "structure_state", "entry_quality_score", "decision_confidence", "timing_decision", "final_action", "position_multiplier", "final_reason", "timing_reason", "trend_strong", "timing_risk_tag", "market_regime", "market_score", "market_strength", "data_integrity_score", "close_price", "candidate_data_source", "candidate_latest_date", "is_expected_trade_date", "data_source_name", "fallback_source_used", "source_attempts_summary", "review_scope", "reason", "risk_note", "original_candidate_rank", "original_reason", "downgrade_reason", "original_account_risk_pct", "mode_account_risk_limit", "account_risk_pass", "original_estimated_amount"],
+            ["symbol", "name", "best_style", "style_state", "final_score", "minimum_score", "base_signal_score", "signal_score", "style_momentum_score", "breadth_score", "style_rotation_bonus", "style_retreat_penalty", "retreat_risk", "structure_state", "entry_quality_score", "decision_confidence", "timing_decision", "final_action", "decision_source", "position_multiplier", "final_reason", "timing_reason", "trend_strong", "timing_risk_tag", "market_regime", "market_score", "market_strength", "portfolio_mode", "final_portfolio_mode", "raw_portfolio_mode", "data_integrity_score", "close_price", "candidate_data_source", "candidate_latest_date", "candidate_raw_latest_date", "is_expected_trade_date", "volume", "amount", "data_source_name", "fallback_source_used", "source_attempts_summary", "review_scope", "reason", "risk_note", "original_candidate_rank", "original_reason", "downgrade_reason", "original_account_risk_pct", "mode_account_risk_limit", "account_risk_pass", "original_estimated_amount", "final_trade_permission", "final_trade_permission_reason"],
         ),
         "",
         "## 交易时机规避名单",
         "",
         _markdown_table(
             timing_avoid_list,
-            ["symbol", "name", "best_style", "style_state", "final_score", "structure_state", "entry_quality_score", "decision_confidence", "timing_decision", "final_action", "position_multiplier", "final_reason", "timing_reason", "trend_strong", "timing_risk_tag", "reason"],
+            ["symbol", "name", "best_style", "style_state", "final_score", "minimum_score", "structure_state", "entry_quality_score", "decision_confidence", "timing_decision", "final_action", "decision_source", "position_multiplier", "final_reason", "timing_reason", "trend_strong", "timing_risk_tag", "market_regime", "market_score", "portfolio_mode", "final_portfolio_mode", "raw_portfolio_mode", "candidate_data_source", "candidate_latest_date", "candidate_raw_latest_date", "is_expected_trade_date", "volume", "amount", "review_scope", "reason", "downgrade_reason", "final_trade_permission", "final_trade_permission_reason"],
         ),
         "",
         "## 数据问题名单 data_issue_list",
