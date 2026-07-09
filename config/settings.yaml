@@ -15,8 +15,8 @@ allow_single_lot_above_position_limit: true
 stock_pool_mode: main_board_all
 prefilter_min_amount: 300000000
 prefilter_max_one_lot_amount: 30000
-max_scan_symbols: 120
-scan_type: candidate_pool
+max_scan_symbols: 300
+scan_type: main_board_prefilter
 account_risk_limit: 0.025
 max_same_style_candidates: 1
 style_state_source: confirmed_style_pool

@@ -6,6 +6,7 @@ from .position_rules import candidate_min_score, get_position_rule
 from .scoring import score_stock
 from .snapshots import snapshot_fetch_results, snapshot_filter_reasons, snapshot_names, snapshots_to_frames
 from .styles import STYLE_DISPLAY_NAMES
+from .trading_decision import make_final_trade_decision
 from .utils import round_price
 
 
@@ -60,7 +61,19 @@ def build_condition_order(candidate: dict, settings: dict, rules: dict, rank: in
         "style_rotation_bonus": candidate.get("style_rotation_bonus", ""),
         "style_retreat_penalty": candidate.get("style_retreat_penalty", ""),
         "retreat_risk": candidate.get("retreat_risk", False),
+        "structure_state": candidate.get("structure_state", ""),
+        "entry_quality_score": candidate.get("entry_quality_score", ""),
+        "decision_confidence": candidate.get("decision_confidence", ""),
+        "timing_decision": candidate.get("timing_decision", ""),
+        "timing_reason": candidate.get("timing_reason", ""),
+        "trend_strong": candidate.get("trend_strong", ""),
+        "timing_risk_tag": candidate.get("timing_risk_tag", ""),
+        "final_action": candidate.get("final_action", ""),
+        "position_multiplier": candidate.get("position_multiplier", ""),
+        "final_reason": candidate.get("final_reason", ""),
         "market_strength": candidate.get("market_strength", 0),
+        "market_regime": candidate.get("market_regime", ""),
+        "market_score": candidate.get("market_score", ""),
         "data_integrity_score": candidate.get("data_integrity_score", 1.0),
         "confidence_position_multiplier": candidate.get("confidence_position_multiplier", 1.0),
         "final_score": candidate["final_score"],
@@ -166,7 +179,45 @@ def _normalize_observation(item: dict) -> dict:
     out.setdefault("review_scope", "observation_only")
     out.setdefault("mode_account_risk_limit", "")
     out.setdefault("account_risk_pass", "")
+    out.setdefault("structure_state", "")
+    out.setdefault("entry_quality_score", "")
+    out.setdefault("decision_confidence", "")
+    out.setdefault("timing_decision", "")
+    out.setdefault("timing_reason", "")
+    out.setdefault("trend_strong", "")
+    out.setdefault("timing_risk_tag", "")
+    out.setdefault("final_action", "")
+    out.setdefault("position_multiplier", "")
+    out.setdefault("final_reason", "")
+    out.setdefault("market_regime", "")
+    out.setdefault("market_score", "")
     return out
+
+
+def _apply_timing_fields(item: dict, timing: dict | None) -> dict:
+    if not timing:
+        return item
+    item.update(
+        {
+            "structure_state": timing.get("structure_state", ""),
+            "entry_quality_score": timing.get("entry_quality_score", ""),
+            "decision_confidence": timing.get("decision_confidence", ""),
+            "timing_decision": timing.get("timing_decision", ""),
+            "timing_reason": timing.get("timing_reason", ""),
+            "trend_strong": timing.get("trend_strong", ""),
+            "timing_risk_tag": timing.get("timing_risk_tag", ""),
+        }
+    )
+    return item
+
+
+def _apply_final_decision_fields(item: dict, decision: dict, market: dict) -> dict:
+    item["final_action"] = decision.get("final_action", "")
+    item["position_multiplier"] = decision.get("position_multiplier", "")
+    item["final_reason"] = "；".join(str(reason) for reason in decision.get("final_reason", []) if reason)
+    item["market_regime"] = market.get("market_regime", "")
+    item["market_score"] = market.get("market_score", "")
+    return item
 
 
 def _defensive_probe_note(style: str, portfolio_mode: str) -> str:
@@ -191,6 +242,7 @@ def _ranked_candidates(
     market: dict,
     settings: dict | None = None,
     scores_by_symbol: dict[str, dict] | None = None,
+    timing_by_symbol: dict[str, dict] | None = None,
 ) -> list[dict]:
     passed = []
     settings = settings or {}
@@ -245,6 +297,7 @@ def _ranked_candidates(
         item["data_integrity_score"] = round(data_integrity_score, 4)
         item["confidence_position_multiplier"] = confidence_multiplier
         item["final_score"] = round(final_score, 2)
+        _apply_timing_fields(item, (timing_by_symbol or {}).get(symbol))
         if style in style_state_by_style:
             item["style_state"] = style_state_by_style[style]
             item["reason"] = _style_state_reason(style, item["style_state"])
@@ -274,10 +327,11 @@ def generate_buy_signals(
     data_quality_level: str = "fresh",
     fetch_results_by_symbol: dict | None = None,
     scores_by_symbol: dict[str, dict] | None = None,
+    timing_by_symbol: dict[str, dict] | None = None,
 ) -> dict:
     forbidden = categorize_forbidden(filter_reasons, names)
     data_issue_list = _data_issue_list(fetch_results_by_symbol, names)
-    ranked = _ranked_candidates(stock_frames, names, filter_reasons, market, settings, scores_by_symbol)
+    ranked = _ranked_candidates(stock_frames, names, filter_reasons, market, settings, scores_by_symbol, timing_by_symbol)
     style_state_by_style = {row["style"]: row["state"] for row in market.get("style_state_table", [])}
     has_style_state_table = "style_state_table" in market
     strongest_styles = {
@@ -292,6 +346,10 @@ def generate_buy_signals(
 
     portfolio_mode = market.get("portfolio_mode", {}).get("portfolio_mode", "cash")
     effective_portfolio_mode = portfolio_mode
+    market_regime = market.get("market_regime")
+    final_decision_enabled = bool(market_regime) or bool(timing_by_symbol)
+    if not market_regime:
+        market_regime = {"attack": "attack", "balanced": "normal", "defensive": "defensive", "cash": "cash"}.get(portfolio_mode, "cash")
     rule = get_position_rule(settings, effective_portfolio_mode)
     max_candidates = int(rule["max_new_candidates"])
     max_total_position = float(rule["max_total_position"])
@@ -312,6 +370,7 @@ def generate_buy_signals(
 
     selected = []
     watchlist = []
+    timing_avoid_list = []
     remaining_amount = available_new_amount
     max_same_style = int(settings.get("max_same_style_candidates", 1))
     min_guaranteed = int((settings.get("minimum_trade_guarantee", {}) or {}).get("min_candidates", 1))
@@ -349,13 +408,43 @@ def generate_buy_signals(
         if candidate["final_score"] < minimum_score and guarantee_slot_available:
             candidate = candidate.copy()
             candidate["reason"] = f"{candidate['reason']}\uff1b\u5e02\u573a\u72b6\u6001\u975e bear\uff0c\u542f\u7528\u6700\u5c0f\u5019\u9009\u4fdd\u969c\uff0c\u4f46\u4ec5\u4f5c\u5c0f\u4ed3\u4f4d\u8bd5\u63a2"
+        if final_decision_enabled:
+            candidate = candidate.copy()
+            decision = make_final_trade_decision(market_regime, candidate)
+            _apply_final_decision_fields(candidate, decision, {**market, "market_regime": market_regime})
+            if decision.get("final_action") != "BUY":
+                item = candidate.copy()
+                item["review_scope"] = "timing_review"
+                item["original_reason"] = candidate.get("reason", "")
+                item["downgrade_reason"] = candidate.get("final_reason") or candidate.get("timing_reason", "最终交易裁决未达到BUY")
+                item["reason"] = f"{candidate.get('reason', '')}；最终裁决={decision.get('final_action')}，{item['downgrade_reason']}"
+                if decision.get("final_action") == "WAIT":
+                    watchlist.append(item)
+                else:
+                    timing_avoid_list.append(item)
+                continue
+
+        timing_decision = candidate.get("timing_decision")
+        if not final_decision_enabled and timing_decision and timing_decision != "BUY":
+            item = candidate.copy()
+            item["review_scope"] = "timing_review"
+            item["original_reason"] = candidate.get("reason", "")
+            item["downgrade_reason"] = candidate.get("timing_reason", "交易时机未满足BUY条件")
+            item["reason"] = f"{candidate.get('reason', '')}；交易时机={timing_decision}，{item['downgrade_reason']}"
+            if timing_decision == "WAIT":
+                watchlist.append(item)
+            else:
+                timing_avoid_list.append(item)
+            continue
+
         if style_counts.get(style, 0) >= max_same_style:
             item = candidate.copy()
             item["reason"] = f"{candidate['reason']}\uff1b\u89e6\u53d1\u540c\u98ce\u683c\u96c6\u4e2d\u5ea6\u9650\u5236\uff0c\u964d\u7ea7\u89c2\u5bdf"
             watchlist.append(item)
             continue
 
-        raw_amount = min(max_single_new_amount, remaining_amount)
+        market_position_multiplier = float(candidate.get("position_multiplier", 1.0) or 1.0)
+        raw_amount = min(max_single_new_amount, remaining_amount) * market_position_multiplier
         order = build_condition_order(candidate, settings, rules, rank=len(selected) + 1, raw_amount=raw_amount)
         if order["suggested_lots"] < 1:
             item = candidate.copy()
@@ -429,12 +518,13 @@ def generate_buy_signals(
     return {
         "candidates": selected,
         "watchlist": [
-            item if item.get("review_scope") in {"candidate_data_review", "candidate_risk_review"} else _normalize_observation(item)
+            item if item.get("review_scope") in {"candidate_data_review", "candidate_risk_review", "timing_review"} else _normalize_observation(item)
             for item in watchlist[:8]
         ],
         "forbidden": forbidden,
         "style_explanations": style_explanations,
         "data_issue_list": data_issue_list,
+        "timing_avoid_list": [_normalize_observation(item) for item in timing_avoid_list[:20]],
     }
 
 
@@ -451,6 +541,11 @@ def generate_buy_signals_from_snapshots(
         for symbol, snapshot in snapshots_by_symbol.items()
         if getattr(snapshot, "score", None) is not None
     }
+    timing_by_symbol = {
+        symbol: snapshot.timing
+        for symbol, snapshot in snapshots_by_symbol.items()
+        if getattr(snapshot, "timing", None)
+    }
     return generate_buy_signals(
         market,
         snapshots_to_frames(snapshots_by_symbol),
@@ -462,6 +557,7 @@ def generate_buy_signals_from_snapshots(
         data_quality_level,
         snapshot_fetch_results(snapshots_by_symbol),
         scores_by_symbol,
+        timing_by_symbol,
     )
 
 

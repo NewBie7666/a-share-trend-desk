@@ -9,6 +9,7 @@ from .data_fetcher import FetchResult
 from .filters import evaluate_hard_filters
 from .indicators import add_indicators
 from .scoring import score_stock
+from .timing import evaluate_timing
 
 
 @dataclass
@@ -23,6 +24,7 @@ class StockSnapshot:
     style: str = "other"
     style_state: str = ""
     risk_state: dict = field(default_factory=dict)
+    timing: dict = field(default_factory=dict)
     data_issue: dict | None = None
 
     @property
@@ -104,6 +106,7 @@ def build_stock_snapshots(
         indicator_compute_count += 1
         filter_reasons = filter_fn(symbol, name, indicators, settings, filter_rules)
         score = scorer_fn(symbol, name, indicators) if not indicators.empty else None
+        timing = evaluate_timing(indicators) if not indicators.empty else {}
         style = (score or {}).get("best_style", "other")
         style_state = (score or {}).get("style_state", "")
         snapshots[symbol] = StockSnapshot(
@@ -117,6 +120,7 @@ def build_stock_snapshots(
             style=style,
             style_state=style_state,
             risk_state={"hard_filter_pass": not bool(filter_reasons)},
+            timing=timing,
             data_issue=None,
         )
         valid_snapshot_count += 1

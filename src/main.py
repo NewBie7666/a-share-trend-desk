@@ -23,6 +23,7 @@ from .data_fetcher import (
 )
 from .data_quality import compute_data_quality_report
 from .indicators import add_indicators
+from .market_regime import evaluate_market_regime
 from .market_state import evaluate_market_state_from_snapshots
 from .report import write_reports
 from .signals import evaluate_holdings_from_snapshots, generate_buy_signals_from_snapshots
@@ -423,6 +424,7 @@ def run_daily_signal() -> int:
         data_quality_level,
         settings,
     )
+    market.update(evaluate_market_regime(market_index_table, snapshots_by_symbol))
     signals = generate_buy_signals_from_snapshots(market, snapshots_by_symbol, settings, risk_rules, holdings, data_quality_level)
     temp_candidate_symbols = {
         str(item.get("symbol", "")).zfill(6)
