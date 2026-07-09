@@ -157,7 +157,7 @@ def test_other_style_never_enters_candidate():
     assert "风格未知" in signals["watchlist"][0]["reason"]
 
 
-def test_minimum_trade_guarantee_allows_one_low_score_neutral_candidate():
+def test_minimum_trade_guarantee_disabled_does_not_allow_low_score_candidate():
     market = {
         "state": "green",
         "market_state": "bull",
@@ -170,8 +170,8 @@ def test_minimum_trade_guarantee_allows_one_low_score_neutral_candidate():
     df.loc[0, "macd_dea"] = 2
     df.loc[0, "rsi14"] = 40
     signals = generate_buy_signals(market, {"600522": df}, {"600522": "中天科技"}, {"600522": []}, settings(), RULES)
-    assert len(signals["candidates"]) == 1
-    assert "最小候选保障" in signals["candidates"][0]["reason"]
+    assert signals["candidates"] == []
+    assert signals["watchlist"]
 
 
 def test_bear_market_generates_no_new_candidate():

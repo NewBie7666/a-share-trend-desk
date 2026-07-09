@@ -109,6 +109,7 @@ def _candidate_source_fields(symbol: str, fetch_results_by_symbol: dict | None) 
         return {
             "candidate_data_source": "fresh",
             "candidate_latest_date": "",
+            "candidate_raw_latest_date": "",
             "is_expected_trade_date": True,
             "data_source_name": "",
             "fallback_source_used": "",
@@ -118,7 +119,8 @@ def _candidate_source_fields(symbol: str, fetch_results_by_symbol: dict | None) 
         }
     return {
         "candidate_data_source": getattr(result, "final_source", "fresh"),
-        "candidate_latest_date": getattr(result, "latest_date", "") or "",
+        "candidate_latest_date": getattr(result, "effective_latest_date", "") or getattr(result, "latest_date", "") or "",
+        "candidate_raw_latest_date": getattr(result, "raw_latest_date", "") or "",
         "is_expected_trade_date": bool(getattr(result, "is_expected_trade_date", True)),
         "data_source_name": getattr(result, "data_source_name", "") or "",
         "fallback_source_used": getattr(result, "fallback_source_used", "") or "",
@@ -138,18 +140,23 @@ def _source_attempts_summary(attempts: list[dict] | None) -> str:
     return "；".join(parts)
 
 
-def _latest_has_trading_volume(symbol: str, stock_frames: dict[str, pd.DataFrame]) -> tuple[bool, str]:
+def _latest_trading_volume_check(symbol: str, stock_frames: dict[str, pd.DataFrame]) -> dict:
     df = stock_frames.get(symbol)
     if df is None or df.empty:
-        return False, "\u65e5\u7ebf\u884c\u60c5\u6570\u636e\u4e3a\u7a7a"
+        return {"has_trading_volume": False, "volume": 0.0, "amount": 0.0, "reason": "\u65e5\u7ebf\u884c\u60c5\u6570\u636e\u4e3a\u7a7a"}
     latest = df.iloc[-1]
     if "volume" not in latest.index or "amount" not in latest.index:
-        return True, ""
+        return {"has_trading_volume": True, "volume": 1.0, "amount": 1.0, "reason": ""}
     volume = float(latest.get("volume", 0) or 0)
     amount = float(latest.get("amount", 0) or 0)
     if volume <= 0 or amount <= 0:
-        return False, "\u5019\u9009\u80a1\u6700\u65b0\u6210\u4ea4\u91cf\u6216\u6210\u4ea4\u989d\u4e3a0\uff0c\u505c\u724c\u98ce\u9669\u515c\u5e95\u672a\u901a\u8fc7"
-    return True, ""
+        return {"has_trading_volume": False, "volume": volume, "amount": amount, "reason": "\u5019\u9009\u80a1\u6700\u65b0\u6210\u4ea4\u91cf\u6216\u6210\u4ea4\u989d\u4e3a0\uff0c\u505c\u724c\u98ce\u9669\u515c\u5e95\u672a\u901a\u8fc7"}
+    return {"has_trading_volume": True, "volume": volume, "amount": amount, "reason": ""}
+
+
+def _latest_has_trading_volume(symbol: str, stock_frames: dict[str, pd.DataFrame]) -> tuple[bool, str]:
+    check = _latest_trading_volume_check(symbol, stock_frames)
+    return bool(check["has_trading_volume"]), str(check.get("reason", ""))
 
 
 def _data_issue_list(fetch_results_by_symbol: dict | None, names: dict[str, str]) -> list[dict]:
@@ -172,6 +179,7 @@ def _normalize_observation(item: dict) -> dict:
     out = item.copy()
     out.setdefault("candidate_data_source", "not_reviewed")
     out.setdefault("candidate_latest_date", "-")
+    out.setdefault("candidate_raw_latest_date", "-")
     out.setdefault("is_expected_trade_date", "-")
     out.setdefault("data_source_name", "")
     out.setdefault("fallback_source_used", "")
@@ -191,6 +199,11 @@ def _normalize_observation(item: dict) -> dict:
     out.setdefault("final_reason", "")
     out.setdefault("market_regime", "")
     out.setdefault("market_score", "")
+    out.setdefault("portfolio_mode", "")
+    out.setdefault("final_portfolio_mode", "")
+    out.setdefault("raw_portfolio_mode", "")
+    out.setdefault("volume", "")
+    out.setdefault("amount", "")
     return out
 
 
@@ -212,12 +225,129 @@ def _apply_timing_fields(item: dict, timing: dict | None) -> dict:
 
 
 def _apply_final_decision_fields(item: dict, decision: dict, market: dict) -> dict:
+    portfolio = market.get("portfolio_mode", {}) or {}
     item["final_action"] = decision.get("final_action", "")
     item["position_multiplier"] = decision.get("position_multiplier", "")
     item["final_reason"] = "；".join(str(reason) for reason in decision.get("final_reason", []) if reason)
     item["market_regime"] = market.get("market_regime", "")
     item["market_score"] = market.get("market_score", "")
+    item["portfolio_mode"] = portfolio.get("portfolio_mode", "")
+    item["final_portfolio_mode"] = portfolio.get("final_portfolio_mode", portfolio.get("portfolio_mode", ""))
+    item["raw_portfolio_mode"] = portfolio.get("raw_portfolio_mode", portfolio.get("portfolio_mode", ""))
     return item
+
+
+def classify_trading_critical_blockers(settings: dict) -> dict:
+    reasons = [str(item) for item in settings.get("trading_critical_reasons", []) or []]
+    codes = [str(code) for code in (settings.get("trading_critical_blocker_codes", []) or [])]
+    if settings.get("trade_calendar_status") == "failed":
+        codes.append("trade_calendar_failed")
+    if settings.get("stock_basic_is_trading_critical"):
+        codes.append("stock_basic_trading_critical")
+    if settings.get("data_quality_level") == "stale":
+        codes.append("stale_data")
+    text = "；".join(reasons)
+    keyword_map = {
+        "core_index_unavailable": ["核心指数", "core index", "000300", "000001", "399001"],
+        "trade_calendar_failed": ["交易日历失败", "trade calendar failed"],
+        "stock_basic_trading_critical": ["ST/退市", "主板范围无法判断", "股票基础信息为交易关键异常", "stock basic"],
+        "market_state_unknown": ["市场状态不可判定", "market_state unknown", "market state unknown"],
+        "broad_daily_data_failure": ["大面积个股日线异常", "大量缓存回退", "broad daily", "too many"],
+        "stale_data": ["数据陈旧", "stale"],
+    }
+    for code, keywords in keyword_map.items():
+        if any(keyword in text for keyword in keywords):
+            codes.append(code)
+    unique_codes = sorted(set(code for code in codes if code))
+    return {
+        "blocked": bool(unique_codes) and settings.get("data_quality_level") in {"critical_cache", "stale"},
+        "blocker_codes": unique_codes,
+        "blocker_reasons": reasons,
+    }
+
+
+def validate_pre_order_candidate(candidate: dict, market: dict, source_fields: dict, volume_check: dict, settings: dict) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    portfolio = market.get("portfolio_mode", {}) or {}
+    portfolio_mode = portfolio.get("portfolio_mode", "cash")
+    market_regime = market.get("market_regime") or {"attack": "attack", "balanced": "normal", "defensive": "defensive", "cash": "cash"}.get(portfolio_mode, "cash")
+    expected_date = settings.get("expected_trade_date", "")
+    if portfolio_mode == "cash":
+        reasons.append("组合模式为 cash，禁止正式新开仓")
+    if market_regime == "cash":
+        reasons.append("市场环境为 cash，禁止正式新开仓")
+    if candidate.get("timing_decision") != "BUY":
+        reasons.append("交易时机不是 BUY")
+    if candidate.get("final_action") != "BUY":
+        reasons.append("最终裁决不是 BUY")
+    if source_fields.get("candidate_data_source") != "fresh":
+        reasons.append("正式候选必须使用 fresh 行情数据")
+    if expected_date and source_fields.get("candidate_latest_date") != expected_date:
+        reasons.append("候选有效行情日期不是预期交易日")
+    if not source_fields.get("is_expected_trade_date"):
+        reasons.append("候选行情未通过预期交易日校验")
+    if not volume_check.get("has_trading_volume"):
+        reasons.append(volume_check.get("reason") or "候选成交量/成交额复核未通过")
+    if float(volume_check.get("volume", 0) or 0) <= 0:
+        reasons.append("候选最新成交量为0")
+    if float(volume_check.get("amount", 0) or 0) <= 0:
+        reasons.append("候选最新成交额为0")
+    return not reasons, reasons
+
+
+def validate_final_candidate(candidate: dict, order: dict, market: dict, source_fields: dict, volume_check: dict, settings: dict) -> tuple[bool, list[str]]:
+    pre_ok, reasons = validate_pre_order_candidate(candidate, market, source_fields, volume_check, settings)
+    if not pre_ok:
+        return False, reasons
+    if order.get("account_risk_pass") is not True:
+        reasons.append("账户风险未通过当前模式上限")
+    if int(order.get("suggested_lots", 0) or 0) < 1:
+        reasons.append("不足一手，不能生成正式买入候选")
+    return not reasons, reasons
+
+
+def _candidate_review_row(candidate: dict, *, review_scope: str, downgrade_reasons: list[str], source_fields: dict | None = None, volume_check: dict | None = None, order: dict | None = None, market: dict | None = None) -> dict:
+    row = candidate.copy()
+    source_fields = source_fields or {}
+    volume_check = volume_check or {}
+    portfolio = (market or {}).get("portfolio_mode", {}) or {}
+    row.update(source_fields)
+    if order:
+        row.update({
+            "original_candidate_rank": order.get("candidate_rank"),
+            "original_account_risk_pct": order.get("account_risk_pct"),
+            "mode_account_risk_limit": order.get("mode_account_risk_limit", ""),
+            "account_risk_pass": order.get("account_risk_pass", ""),
+            "original_estimated_amount": order.get("estimated_amount"),
+            "suggested_lots": order.get("suggested_lots", ""),
+            "estimated_amount": order.get("estimated_amount", ""),
+        })
+    row["volume"] = volume_check.get("volume", row.get("volume", ""))
+    row["amount"] = volume_check.get("amount", row.get("amount", ""))
+    row["review_scope"] = review_scope
+    row["original_score"] = candidate.get("score")
+    row["original_final_score"] = candidate.get("final_score")
+    row["original_reason"] = candidate.get("reason", "")
+    row["downgrade_reason"] = "；".join(reason for reason in downgrade_reasons if reason)
+    row["reason"] = f"{candidate.get('reason', '')}；{row['downgrade_reason']}"
+    row["portfolio_mode"] = row.get("portfolio_mode") or portfolio.get("portfolio_mode", "")
+    row["final_portfolio_mode"] = row.get("final_portfolio_mode") or portfolio.get("final_portfolio_mode", portfolio.get("portfolio_mode", ""))
+    row["raw_portfolio_mode"] = row.get("raw_portfolio_mode") or portfolio.get("raw_portfolio_mode", portfolio.get("portfolio_mode", ""))
+    return row
+
+
+def build_final_trade_permission(market: dict, signals: dict, settings: dict) -> dict:
+    blocker = classify_trading_critical_blockers(settings)
+    portfolio = market.get("portfolio_mode", {}) or {}
+    if blocker["blocked"]:
+        return {"final_trade_permission": "数据不支持正式新开仓", "final_trade_permission_reason": blocker["blocker_reasons"] or blocker["blocker_codes"]}
+    if market.get("market_regime") == "cash":
+        return {"final_trade_permission": "市场环境禁止新开仓", "final_trade_permission_reason": ["market_regime=cash"]}
+    if portfolio.get("portfolio_mode") == "cash":
+        return {"final_trade_permission": "组合模式禁止新开仓", "final_trade_permission_reason": ["portfolio_mode=cash"]}
+    if not signals.get("candidates"):
+        return {"final_trade_permission": "暂无满足数据、时机和风控的正式候选", "final_trade_permission_reason": ["无正式BUY候选"]}
+    return {"final_trade_permission": "可按规则轻仓关注正式候选", "final_trade_permission_reason": ["存在通过最终校验的正式候选"]}
 
 
 def _defensive_probe_note(style: str, portfolio_mode: str) -> str:
@@ -329,9 +459,12 @@ def generate_buy_signals(
     scores_by_symbol: dict[str, dict] | None = None,
     timing_by_symbol: dict[str, dict] | None = None,
 ) -> dict:
+    settings = dict(settings)
+    settings.setdefault("data_quality_level", data_quality_level)
     forbidden = categorize_forbidden(filter_reasons, names)
     data_issue_list = _data_issue_list(fetch_results_by_symbol, names)
     ranked = _ranked_candidates(stock_frames, names, filter_reasons, market, settings, scores_by_symbol, timing_by_symbol)
+    critical_blocker = classify_trading_critical_blockers(settings)
     style_state_by_style = {row["style"]: row["state"] for row in market.get("style_state_table", [])}
     has_style_state_table = "style_state_table" in market
     strongest_styles = {
@@ -342,7 +475,9 @@ def generate_buy_signals(
 
     market_state = market.get("market_state") or {"green": "bull", "yellow": "neutral", "red": "bear"}.get(market.get("state"), "unknown")
     if market_state in {"bear", "unknown"}:
-        return {"candidates": [], "watchlist": [_normalize_observation(item) for item in ranked[:5]], "forbidden": forbidden, "data_issue_list": data_issue_list}
+        result = {"candidates": [], "watchlist": [_normalize_observation(item) for item in ranked[:5]], "forbidden": forbidden, "data_issue_list": data_issue_list}
+        result.update(build_final_trade_permission(market, result, settings))
+        return result
 
     portfolio_mode = market.get("portfolio_mode", {}).get("portfolio_mode", "cash")
     effective_portfolio_mode = portfolio_mode
@@ -366,16 +501,31 @@ def generate_buy_signals(
             copied = item.copy()
             copied["reason"] = f"{item['reason']}\uff1b\u65b0\u5f00\u4ed3\u53ef\u7528\u989d\u5ea6\u4e0d\u8db3"
             watch.append(copied)
-        return {"candidates": [], "watchlist": [_normalize_observation(item) for item in watch], "forbidden": forbidden, "style_explanations": [], "data_issue_list": data_issue_list}
+        result = {"candidates": [], "watchlist": [_normalize_observation(item) for item in watch], "forbidden": forbidden, "style_explanations": [], "data_issue_list": data_issue_list}
+        result.update(build_final_trade_permission(market, result, settings))
+        return result
 
     selected = []
     watchlist = []
     timing_avoid_list = []
     remaining_amount = available_new_amount
     max_same_style = int(settings.get("max_same_style_candidates", 1))
-    min_guaranteed = int((settings.get("minimum_trade_guarantee", {}) or {}).get("min_candidates", 1))
     style_counts: dict[str, int] = {}
     style_explanations: list[str] = []
+
+    if critical_blocker["blocked"]:
+        watch = [
+            _candidate_review_row(
+                item,
+                review_scope="candidate_data_review",
+                downgrade_reasons=critical_blocker["blocker_reasons"] or critical_blocker["blocker_codes"],
+                market=market,
+            )
+            for item in ranked[:8]
+        ]
+        result = {"candidates": [], "watchlist": [_normalize_observation(item) for item in watch], "forbidden": forbidden, "style_explanations": [], "data_issue_list": data_issue_list, "timing_avoid_list": []}
+        result.update(build_final_trade_permission(market, result, settings))
+        return result
 
     for candidate in ranked:
         if len(selected) >= max_candidates:
@@ -399,15 +549,11 @@ def generate_buy_signals(
             watchlist.append(item)
             continue
         minimum_score = candidate_min_score(effective_portfolio_mode, style_state, settings)
-        guarantee_slot_available = len(selected) < min_guaranteed and market_state in {"bull", "neutral"}
-        if candidate["final_score"] < minimum_score and not guarantee_slot_available:
+        if candidate["final_score"] < minimum_score:
             item = candidate.copy()
             item["reason"] = f"{candidate['reason']}\uff1b\u5f53\u524d {portfolio_mode} \u6a21\u5f0f\u6700\u4f4e\u5206\u8981\u6c42\u4e3a {minimum_score:.0f}\uff0c\u5206\u6570\u4e0d\u8db3"
             watchlist.append(item)
             continue
-        if candidate["final_score"] < minimum_score and guarantee_slot_available:
-            candidate = candidate.copy()
-            candidate["reason"] = f"{candidate['reason']}\uff1b\u5e02\u573a\u72b6\u6001\u975e bear\uff0c\u542f\u7528\u6700\u5c0f\u5019\u9009\u4fdd\u969c\uff0c\u4f46\u4ec5\u4f5c\u5c0f\u4ed3\u4f4d\u8bd5\u63a2"
         if final_decision_enabled:
             candidate = candidate.copy()
             decision = make_final_trade_decision(market_regime, candidate)
@@ -437,85 +583,71 @@ def generate_buy_signals(
                 timing_avoid_list.append(item)
             continue
 
+        if not final_decision_enabled:
+            candidate = candidate.copy()
+            candidate.setdefault("timing_decision", "BUY")
+            candidate.setdefault("final_action", "BUY")
+
         if style_counts.get(style, 0) >= max_same_style:
             item = candidate.copy()
             item["reason"] = f"{candidate['reason']}\uff1b\u89e6\u53d1\u540c\u98ce\u683c\u96c6\u4e2d\u5ea6\u9650\u5236\uff0c\u964d\u7ea7\u89c2\u5bdf"
             watchlist.append(item)
             continue
 
+        source_fields = _candidate_source_fields(candidate["symbol"], fetch_results_by_symbol)
+        volume_check = _latest_trading_volume_check(candidate["symbol"], stock_frames)
+        pre_ok, pre_reasons = validate_pre_order_candidate(candidate, market, source_fields, volume_check, settings)
+        if not pre_ok:
+            watchlist.append(
+                _candidate_review_row(
+                    candidate,
+                    review_scope="candidate_data_review",
+                    downgrade_reasons=pre_reasons,
+                    source_fields=source_fields,
+                    volume_check=volume_check,
+                    market=market,
+                )
+            )
+            continue
+
         market_position_multiplier = float(candidate.get("position_multiplier", 1.0) or 1.0)
         raw_amount = min(max_single_new_amount, remaining_amount) * market_position_multiplier
         order = build_condition_order(candidate, settings, rules, rank=len(selected) + 1, raw_amount=raw_amount)
-        if order["suggested_lots"] < 1:
-            item = candidate.copy()
-            item["reason"] = f"{candidate['reason']}\uff1b\u4e00\u624b\u91d1\u989d\u8d85\u8fc7\u5141\u8bb8\u5355\u7968\u989d\u5ea6\uff0c\u89c2\u5bdf\u4e0d\u4e70"
-            item["risk_note"] = f"\u4e00\u624b\u91d1\u989d\u7ea6 {one_lot_amount(order['trigger_price'], settings):.2f} \u5143\uff0c\u5f53\u524d\u53ef\u7528\u989d\u5ea6\u4e3a {raw_amount:.2f} \u5143"
-            watchlist.append(item)
-            if style in strongest_styles:
-                style_explanations.append(f"{style} \u98ce\u683c\u8f83\u5f3a\uff0c\u4f46\u5019\u9009\u80a1\u56e0\u4e00\u624b\u91d1\u989d\u8d85\u8fc7\u989d\u5ea6\u88ab\u964d\u7ea7\u89c2\u5bdf\u3002")
-            continue
-
         mode_account_risk_limit = float(rule.get("max_account_risk_pct", settings.get("account_risk_limit", 0.025)))
         order["mode_account_risk_limit"] = mode_account_risk_limit
         order["account_risk_pass"] = order["account_risk_pct"] <= mode_account_risk_limit
-        if not order["account_risk_pass"]:
-            item = candidate.copy()
-            item.update(
-                {
-                    "original_candidate_rank": len(selected) + 1,
-                    "original_reason": candidate["reason"],
-                    "original_account_risk_pct": order["account_risk_pct"],
-                    "mode_account_risk_limit": mode_account_risk_limit,
-                    "account_risk_pass": False,
-                    "original_estimated_amount": order["estimated_amount"],
-                    "downgrade_reason": f"{portfolio_mode} 模式下账户风险超过上限",
-                    "review_scope": "candidate_risk_review",
-                    "candidate_data_source": "not_reviewed",
-                    "candidate_latest_date": "-",
-                    "is_expected_trade_date": "-",
-                }
+        final_ok, final_reasons = validate_final_candidate(candidate, order, market, source_fields, volume_check, settings)
+        if not final_ok:
+            watchlist.append(
+                _candidate_review_row(
+                    candidate,
+                    review_scope="candidate_risk_review",
+                    downgrade_reasons=final_reasons,
+                    source_fields=source_fields,
+                    volume_check=volume_check,
+                    order=order,
+                    market=market,
+                )
             )
-            item["reason"] = f"{candidate['reason']}\uff1b{portfolio_mode} \u6a21\u5f0f\u4e0b\u8d26\u6237\u98ce\u9669\u8d85\u8fc7\u4e0a\u9650"
-            item["risk_note"] = f"\u8d26\u6237\u98ce\u9669\u6bd4\u4f8b={order['account_risk_pct']:.2%}\uff0c\u5f53\u524d\u6a21\u5f0f\u4e0a\u9650={mode_account_risk_limit:.2%}"
-            watchlist.append(item)
             if style in strongest_styles:
-                style_explanations.append(f"{style} \u98ce\u683c\u8f83\u5f3a\uff0c\u4f46\u5019\u9009\u80a1\u56e0\u8d26\u6237\u98ce\u9669\u8d85\u8fc7\u4e0a\u9650\u88ab\u964d\u7ea7\u89c2\u5bdf\u3002")
+                style_explanations.append(f"{style} 风格存在，但候选未通过账户风险、整手数量或最终校验。")
             continue
 
         note = _defensive_probe_note(style, portfolio_mode)
         if note:
             order["risk_note"] = f"{order['risk_note']}; {note}"
+        order.update(source_fields)
+        order["volume"] = volume_check.get("volume", "")
+        order["amount"] = volume_check.get("amount", "")
         selected.append(order)
         remaining_amount -= order["estimated_amount"]
         style_counts[style] = style_counts.get(style, 0) + 1
         if remaining_amount <= 0:
             break
 
-    source_downgraded = []
-    kept_selected = []
-    for item in selected:
-        source_fields = _candidate_source_fields(item["symbol"], fetch_results_by_symbol)
-        has_volume, volume_reason = _latest_has_trading_volume(item["symbol"], stock_frames)
-        item.update(source_fields)
-        if source_fields["candidate_data_source"] in {"fresh", "cache"} and source_fields["is_expected_trade_date"] and has_volume:
-            kept_selected.append(item)
-            continue
-        copied = item.copy()
-        copied["original_candidate_rank"] = item.get("candidate_rank")
-        copied["original_reason"] = item.get("reason")
-        copied["downgrade_reason"] = volume_reason or "候选数据不可用、非预期交易日或数据源失败，不能生成正式买入候选"
-        copied["original_account_risk_pct"] = item.get("account_risk_pct")
-        copied["original_estimated_amount"] = item.get("estimated_amount")
-        copied["reason"] = "\u8be5\u80a1\u7968\u539f\u672c\u6ee1\u8db3\u5019\u9009\u6761\u4ef6\uff0c\u4f46\u56e0\u6570\u636e\u6e90\u590d\u6838\u672a\u901a\u8fc7\uff0c\u964d\u7ea7\u89c2\u5bdf"
-        copied["review_scope"] = "candidate_data_review"
-        source_downgraded.append(copied)
-    selected = kept_selected
-
-    if source_downgraded:
-        watchlist = source_downgraded + watchlist
     if strongest_styles and not selected:
         style_explanations.append(f"strongest_styles: {', '.join(sorted(strongest_styles))}\uff1b\u5f3a\u98ce\u683c\u5b58\u5728\uff0c\u4f46\u6ca1\u6709\u901a\u8fc7\u98ce\u63a7\u3001\u989d\u5ea6\u4e0e\u6570\u636e\u590d\u6838\u7684\u6b63\u5f0f\u4e70\u5165\u5019\u9009\u3002")
-    return {
+    result = {
         "candidates": selected,
         "watchlist": [
             item if item.get("review_scope") in {"candidate_data_review", "candidate_risk_review", "timing_review"} else _normalize_observation(item)
@@ -526,6 +658,8 @@ def generate_buy_signals(
         "data_issue_list": data_issue_list,
         "timing_avoid_list": [_normalize_observation(item) for item in timing_avoid_list[:20]],
     }
+    result.update(build_final_trade_permission(market, result, settings))
+    return result
 
 
 def generate_buy_signals_from_snapshots(

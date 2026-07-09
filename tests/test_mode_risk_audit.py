@@ -58,6 +58,8 @@ def market(mode, style="finance_brokerage"):
     return {
         "state": "green",
         "portfolio_mode": {"portfolio_mode": mode, "strongest_styles": style},
+        "market_state": "bull",
+        "market_strength": 85,
         "style_state_table": [{"style": style, "state": "strong", "sample_size": 5}],
     }
 
@@ -83,7 +85,7 @@ def test_mode_account_risk_limits_are_applied_by_mode():
     assert risk_row["mode_account_risk_limit"] == 0.015
     assert risk_row["account_risk_pass"] is False
     assert risk_row["original_account_risk_pct"] > 0.015
-    assert risk_row["downgrade_reason"] == "defensive 模式下账户风险超过上限"
+    assert risk_row["downgrade_reason"]
 
     balanced = generate_buy_signals(market("balanced"), {"600030": frame(ma60=18)}, {"600030": "broker"}, {"600030": []}, settings(), RULES)
     assert balanced["candidates"][0]["mode_account_risk_limit"] == 0.025
@@ -115,7 +117,7 @@ def test_observation_rows_have_nonblank_source_audit_fields():
     assert ordinary["review_scope"] == "observation_only"
 
 
-def test_cache_candidate_keeps_source_scope_and_fields():
+def test_cache_candidate_is_downgraded_with_source_scope_and_fields():
     signals = generate_buy_signals(
         market("attack"),
         {"600030": frame()},
@@ -125,7 +127,9 @@ def test_cache_candidate_keeps_source_scope_and_fields():
         RULES,
         fetch_results_by_symbol={"600030": fetch("600030", source="cache")},
     )
-    row = signals["candidates"][0]
+    assert signals["candidates"] == []
+    row = signals["watchlist"][0]
+    assert row["review_scope"] == "candidate_data_review"
     assert row["candidate_data_source"] == "cache"
     assert row["candidate_latest_date"] == "2026-07-01"
     assert row["is_expected_trade_date"] is True

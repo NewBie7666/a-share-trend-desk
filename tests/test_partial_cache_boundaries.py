@@ -132,7 +132,7 @@ def test_partial_cache_does_not_degrade_portfolio_mode_in_v2():
 
 
 def test_formal_candidate_has_data_source_fields():
-    market = {"state": "green", "market_state": "bull", "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+    market = {"state": "green", "market_state": "bull", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
     signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030")})
     candidate = signals["candidates"][0]
     assert candidate["candidate_data_source"] == "fresh"
@@ -140,11 +140,12 @@ def test_formal_candidate_has_data_source_fields():
     assert candidate["is_expected_trade_date"] is True
 
 
-def test_candidate_cache_is_allowed_but_unexpected_date_is_downgraded():
-    market = {"state": "green", "market_state": "bull", "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+def test_candidate_cache_and_unexpected_date_are_downgraded():
+    market = {"state": "green", "market_state": "bull", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
     signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030", source="cache")})
-    assert len(signals["candidates"]) == 1
-    assert signals["candidates"][0]["candidate_data_source"] == "cache"
+    assert signals["candidates"] == []
+    assert signals["watchlist"][0]["candidate_data_source"] == "cache"
+    assert signals["watchlist"][0]["review_scope"] == "candidate_data_review"
 
     signals = generate_buy_signals(market, {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030", expected=False)})
     assert signals["candidates"] == []
@@ -152,14 +153,14 @@ def test_candidate_cache_is_allowed_but_unexpected_date_is_downgraded():
 
 
 def test_zero_volume_or_amount_downgrades_candidate():
-    market = {"state": "green", "market_state": "bull", "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+    market = {"state": "green", "market_state": "bull", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
     signals = generate_buy_signals(market, {"600030": frame(volume=0)}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030")})
     assert signals["candidates"] == []
     assert "成交量或成交额为0" in signals["watchlist"][0]["downgrade_reason"]
 
 
 def test_failed_source_enters_data_issue_list_and_not_candidate():
-    market = {"state": "green", "market_state": "bull", "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
+    market = {"state": "green", "market_state": "bull", "market_strength": 85, "portfolio_mode": {"portfolio_mode": "attack", "strongest_styles": "finance_brokerage"}, "style_state_table": [{"style": "finance_brokerage", "state": "strong", "sample_size": 5}]}
     signals = generate_buy_signals(market, {"600030": pd.DataFrame()}, {"600030": "中信证券"}, {"600030": ["行情数据不可用于交易信号"]}, settings(), RULES, fetch_results_by_symbol={"600030": fetch("600030", source="failed", empty=True)})
     assert signals["candidates"] == []
     assert signals["watchlist"] == []

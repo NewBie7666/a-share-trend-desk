@@ -15,7 +15,8 @@ allow_single_lot_above_position_limit: true
 stock_pool_mode: main_board_all
 prefilter_min_amount: 300000000
 prefilter_max_one_lot_amount: 30000
-max_scan_symbols: 300
+runtime_profile: fast
+max_scan_symbols: 120
 scan_type: main_board_prefilter
 account_risk_limit: 0.025
 max_same_style_candidates: 1
@@ -30,7 +31,25 @@ data_integrity:
     low: 0.6
     very_low: 0.4
 minimum_trade_guarantee:
-  min_candidates: 1
+  enabled: false
+  min_candidates: 0
+profiles:
+  fast:
+    max_scan_symbols: 120
+    data_fetch:
+      request_interval_seconds: 0.3
+      max_retries: 2
+      retry_backoff_seconds: [1, 3]
+      batch_size: 30
+      batch_pause_seconds: 3
+  stable:
+    max_scan_symbols: 300
+    data_fetch:
+      request_interval_seconds: 1.0
+      max_retries: 3
+      retry_backoff_seconds: [1, 3, 6]
+      batch_size: 20
+      batch_pause_seconds: 8
 position_rules:
   attack:
     max_total_position: 0.80
@@ -57,14 +76,14 @@ position_rules:
     min_score: 999
     max_account_risk_pct: 0.000
 data_fetch:
-  request_interval_seconds: 1.0
-  max_retries: 3
-  retry_backoff_seconds: [1, 3, 6]
+  request_interval_seconds: 0.3
+  max_retries: 2
+  retry_backoff_seconds: [1, 3]
   enable_parallel_fetch: false
   max_workers: 1
   jitter_seconds: 0.3
-  batch_size: 20
-  batch_pause_seconds: 8
+  batch_size: 30
+  batch_pause_seconds: 3
   consecutive_failure_soft_limit: 5
   consecutive_failure_soft_pause_seconds: 10
   consecutive_failure_hard_limit: 15

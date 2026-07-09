@@ -4,9 +4,11 @@ from types import SimpleNamespace
 
 import pandas as pd
 
+from src.data_fetcher import FetchResult
 from src.market_regime import evaluate_market_regime
 from src.signals import generate_buy_signals
 from src.trading_decision import make_final_trade_decision
+from src.utils import load_config
 
 
 RULES = {
@@ -24,7 +26,7 @@ def settings() -> dict:
         "initial_cash": 30000,
         "lot_size": 100,
         "max_same_style_candidates": 1,
-        "minimum_trade_guarantee": {"min_candidates": 1},
+        "minimum_trade_guarantee": {"enabled": False, "min_candidates": 0},
         "data_integrity_report": {"data_integrity_score": 1.0, "confidence_position_multiplier": 1.0},
         "data_integrity": {"signal_score_weight": 0.70, "market_strength_weight": 0.20, "score_weight": 0.10},
         "position_rules": {
@@ -172,3 +174,109 @@ def test_generate_signals_requires_final_action_buy():
     waiting = generate_buy_signals(market("normal"), {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, timing_by_symbol=wait_timing)
     assert waiting["candidates"] == []
     assert waiting["watchlist"][0]["final_action"] == "WAIT"
+
+
+def test_cache_candidate_is_rejected_before_order():
+    timing = {"600030": {"timing_decision": "BUY", "structure_state": "breakout", "entry_quality_score": 82, "decision_confidence": 0.85}}
+    fetch = FetchResult(
+        "600030",
+        "中信证券",
+        frame(),
+        True,
+        final_source="cache",
+        latest_date="2026-07-01",
+        effective_latest_date="2026-07-01",
+        expected_trade_date="2026-07-01",
+        is_expected_trade_date=True,
+    )
+    cfg = settings()
+    cfg["expected_trade_date"] = "2026-07-01"
+    signals = generate_buy_signals(
+        market("normal"),
+        {"600030": frame()},
+        {"600030": "中信证券"},
+        {"600030": []},
+        cfg,
+        RULES,
+        fetch_results_by_symbol={"600030": fetch},
+        timing_by_symbol=timing,
+    )
+    assert signals["candidates"] == []
+    row = signals["watchlist"][0]
+    assert row["review_scope"] == "candidate_data_review"
+    assert row["candidate_data_source"] == "cache"
+    assert "fresh" in row["downgrade_reason"]
+
+
+def test_candidate_latest_date_uses_effective_latest_date():
+    timing = {"600030": {"timing_decision": "BUY", "structure_state": "breakout", "entry_quality_score": 82, "decision_confidence": 0.85}}
+    fetch = FetchResult(
+        "600030",
+        "中信证券",
+        frame(),
+        False,
+        final_source="fresh",
+        latest_date="2026-07-01",
+        raw_latest_date="2026-07-02",
+        effective_latest_date="2026-07-01",
+        expected_trade_date="2026-07-01",
+        is_expected_trade_date=True,
+    )
+    cfg = settings()
+    cfg["expected_trade_date"] = "2026-07-01"
+    signals = generate_buy_signals(
+        market("normal"),
+        {"600030": frame()},
+        {"600030": "中信证券"},
+        {"600030": []},
+        cfg,
+        RULES,
+        fetch_results_by_symbol={"600030": fetch},
+        timing_by_symbol=timing,
+    )
+    assert signals["candidates"][0]["candidate_latest_date"] == "2026-07-01"
+    assert signals["candidates"][0]["candidate_raw_latest_date"] == "2026-07-02"
+
+
+def test_critical_core_index_blocker_globally_blocks_candidates():
+    timing = {"600030": {"timing_decision": "BUY", "structure_state": "breakout", "entry_quality_score": 82, "decision_confidence": 0.85}}
+    cfg = settings()
+    cfg["data_quality_level"] = "critical_cache"
+    cfg["trading_critical_reasons"] = ["核心指数异常"]
+    signals = generate_buy_signals(
+        market("normal"),
+        {"600030": frame()},
+        {"600030": "中信证券"},
+        {"600030": []},
+        cfg,
+        RULES,
+        timing_by_symbol=timing,
+        data_quality_level="critical_cache",
+    )
+    assert signals["candidates"] == []
+    assert signals["final_trade_permission"] == "数据不支持正式新开仓"
+    assert signals["watchlist"][0]["review_scope"] == "candidate_data_review"
+
+
+def test_final_trade_permission_priority_for_no_candidate():
+    wait_timing = {"600030": {"timing_decision": "WAIT", "structure_state": "pullback", "entry_quality_score": 68, "decision_confidence": 0.65}}
+    signals = generate_buy_signals(
+        market("normal"),
+        {"600030": frame()},
+        {"600030": "中信证券"},
+        {"600030": []},
+        settings(),
+        RULES,
+        timing_by_symbol=wait_timing,
+    )
+    assert signals["final_trade_permission"] == "暂无满足数据、时机和风控的正式候选"
+
+
+def test_runtime_profile_fast_is_applied():
+    loaded = load_config()["settings"]
+    assert loaded["runtime_profile"] == "fast"
+    assert loaded["max_scan_symbols"] == 120
+    assert loaded["data_fetch"]["request_interval_seconds"] == 0.3
+    assert loaded["data_fetch"]["batch_size"] == 30
+    assert loaded["data_fetch"]["batch_pause_seconds"] == 3
+    assert loaded["data_fetch"]["max_retries"] == 2

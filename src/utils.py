@@ -113,11 +113,26 @@ def _simple_yaml_load_nested_map(lines: list[str]) -> dict[str, Any]:
 
 
 def load_config() -> dict[str, Any]:
+    settings = load_yaml(CONFIG_DIR / "settings.yaml")
+    _apply_runtime_profile(settings)
     return {
-        "settings": load_yaml(CONFIG_DIR / "settings.yaml"),
+        "settings": settings,
         "stock_pool": load_yaml(CONFIG_DIR / "stock_pool.yaml").get("stocks", []),
         "risk_rules": load_yaml(CONFIG_DIR / "risk_rules.yaml"),
     }
+
+
+def _apply_runtime_profile(settings: dict[str, Any]) -> None:
+    profile_name = settings.get("runtime_profile", "fast")
+    profiles = settings.get("profiles", {}) or {}
+    profile = profiles.get(profile_name, {}) or {}
+    if "max_scan_symbols" in profile:
+        settings["max_scan_symbols"] = profile["max_scan_symbols"]
+    profile_fetch = profile.get("data_fetch", {}) or {}
+    if profile_fetch:
+        fetch_cfg = dict(settings.get("data_fetch", {}) or {})
+        fetch_cfg.update(profile_fetch)
+        settings["data_fetch"] = fetch_cfg
 
 
 def ensure_directories() -> None:
