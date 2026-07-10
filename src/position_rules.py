@@ -23,6 +23,13 @@ DEFAULT_POSITION_RULES = {
         "min_score": 78,
         "max_account_risk_pct": 0.015,
     },
+    "structural_market": {
+        "max_total_position": 0.40,
+        "max_single_position": 0.20,
+        "max_new_candidates": 2,
+        "min_score": 78,
+        "max_account_risk_pct": 0.015,
+    },
     "cash": {
         "max_total_position": 0.00,
         "max_single_position": 0.00,
@@ -47,6 +54,7 @@ def trade_permission_text(portfolio_mode: str) -> str:
         "attack": "可进攻交易",
         "balanced": "轻仓试探，不追高",
         "defensive": "防守仓位，仅允许低账户风险、低金额、fresh 数据候选；不追高，不加码。",
+        "structural_market": "结构性行情仓位，仅允许时机 BUY、fresh 数据与低账户风险候选。",
         "cash": "不新开仓",
     }.get(portfolio_mode, "不新开仓")
 
@@ -56,6 +64,7 @@ def operation_summary(portfolio_mode: str, strongest_styles: str = "无", potent
         "attack": "今日为 attack 模式，可按规则关注正式候选，但仍需控制单票风险。",
         "balanced": "今日为 balanced 模式，仅允许轻仓试探；不追高，不补位。",
         "defensive": "今日为 defensive 模式，采用防守仓位；仅允许低账户风险、低金额、fresh 数据候选，不追高，不加码。",
+        "structural_market": "今日为 structural_market 模式，指数环境偏弱但个股机会活跃；仅限小仓位、fresh 数据且时机 BUY 的候选。",
         "cash": "今日为 cash 模式，不新开仓，只处理已有持仓。",
     }.get(portfolio_mode, "今日不新开仓，只处理已有持仓。")
     if strongest_styles == "无" and potential_strong_styles and potential_strong_styles != "无":

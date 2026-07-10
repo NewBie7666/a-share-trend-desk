@@ -24,7 +24,8 @@ from .data_fetcher import (
 from .data_quality import compute_data_quality_report
 from .indicators import add_indicators
 from .market_regime import evaluate_market_regime
-from .market_state import evaluate_market_state_from_snapshots
+from .market_state import apply_market_opportunity, evaluate_market_state_from_snapshots
+from .pool_layers import pool_metadata, select_analysis_pool, select_candidate_pool, subset_snapshots
 from .report import write_reports
 from .signals import evaluate_holdings_from_snapshots, generate_buy_signals_from_snapshots
 from .snapshots import build_stock_snapshots, snapshot_data_issue_list
@@ -295,13 +296,20 @@ def run_daily_signal() -> int:
     settings["trade_calendar_status"] = trade_calendar_status
 
     console.print("[bold]Step 1/5: loading stock pool...[/bold]")
-    stock_pool, pool_used_cache, pool_error = load_main_board_stock_pool(settings, config["stock_pool"])
+    stock_pool, pool_used_cache, pool_error, scan_pool_meta = load_main_board_stock_pool(settings, config["stock_pool"])
     holdings = load_holdings()
     merged = {item["symbol"]: item for item in stock_pool}
     for item in config["stock_pool"]:
         merged.setdefault(item["symbol"], item)
-    stock_pool = list(merged.values())
+    stock_pool = list(merged.values())[: int(settings.get("max_scan_symbols", 500))]
+    scan_pool_meta = pool_metadata(
+        stock_pool,
+        version=str(settings.get("pool_version", "v2.1")),
+        source=scan_pool_meta.get("pool_source", ""),
+    )
     settings["scan_count"] = len(stock_pool)
+    settings.update(scan_pool_meta)
+    settings["pool_layers"] = [{"pool": "scan_pool", "size": len(stock_pool), "source": scan_pool_meta.get("pool_source", "")}]
     names = {item["symbol"]: item["name"] for item in stock_pool}
 
     console.print(f"[bold]Step 2/5: fetching indices and daily bars, scan_count={len(stock_pool)}...[/bold]")
@@ -414,18 +422,45 @@ def run_daily_signal() -> int:
     settings["performance_summary"] = performance_summary
     settings["data_issue_list"] = snapshot_data_issue_list(snapshots_by_symbol)
 
+    analysis_symbols = select_analysis_pool(
+        stock_pool,
+        snapshots_by_symbol,
+        int(settings.get("analysis_pool_size", 150)),
+    )
+    analysis_snapshots = subset_snapshots(snapshots_by_symbol, analysis_symbols)
+    candidate_symbols = select_candidate_pool(
+        analysis_snapshots,
+        int(settings.get("candidate_pool_size", 30)),
+    )
+    candidate_snapshots = subset_snapshots(analysis_snapshots, candidate_symbols)
+    analysis_pool = [item for item in stock_pool if str(item.get("symbol", "")).zfill(6) in set(analysis_symbols)]
+    candidate_pool = [item for item in analysis_pool if str(item.get("symbol", "")).zfill(6) in set(candidate_symbols)]
+    settings["pool_layers"] = [
+        {"pool": "scan_pool", "size": len(stock_pool), "source": scan_pool_meta.get("pool_source", "")},
+        {"pool": "analysis_pool", "size": len(analysis_pool), "source": "流动性排序并保留行业覆盖"},
+        {"pool": "candidate_pool", "size": len(candidate_pool), "source": "沿用现有评分排序"},
+    ]
+    settings["analysis_pool_size"] = len(analysis_pool)
+    settings["candidate_pool_size"] = len(candidate_pool)
+    settings["industry_distribution"] = pool_metadata(
+        stock_pool,
+        version=str(settings.get("pool_version", "v2.1")),
+        source=scan_pool_meta.get("pool_source", ""),
+    )["industry_distribution"]
+
     console.print("[bold]Step 4/5: evaluating market state and signals...[/bold]")
     market = evaluate_market_state_from_snapshots(
         hs300,
-        snapshots_by_symbol,
+        analysis_snapshots,
         risk_rules,
-        confirmed_style_symbols,
+        set(analysis_symbols),
         market_index_table,
         data_quality_level,
         settings,
     )
-    market.update(evaluate_market_regime(market_index_table, snapshots_by_symbol))
-    signals = generate_buy_signals_from_snapshots(market, snapshots_by_symbol, settings, risk_rules, holdings, data_quality_level)
+    market.update(evaluate_market_regime(market_index_table, analysis_snapshots))
+    market = apply_market_opportunity(market, analysis_snapshots, settings)
+    signals = generate_buy_signals_from_snapshots(market, candidate_snapshots, settings, risk_rules, holdings, data_quality_level)
     temp_candidate_symbols = {
         str(item.get("symbol", "")).zfill(6)
         for item in signals.get("candidates", [])

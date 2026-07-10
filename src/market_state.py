@@ -52,6 +52,103 @@ def _market_strength(regime: str, index_rows: list[dict]) -> float:
     return round(max(0.0, min(100.0, base + adjustment)), 2)
 
 
+def _breadth_persistence(snapshots_by_symbol: dict, threshold: float = 0.55) -> tuple[int, list[dict]]:
+    """Count consecutive complete trading days with broad upward participation."""
+    rows_by_offset: list[dict] = []
+    for offset in range(1, 4):
+        rows = []
+        rising = 0
+        for snapshot in snapshots_by_symbol.values():
+            indicators = getattr(snapshot, "indicators", None)
+            if not getattr(snapshot, "usable_for_signal", False) or indicators is None or len(indicators) < offset:
+                continue
+            row = indicators.iloc[-offset]
+            rows.append(row)
+            if len(indicators) > offset and float(row.get("close", 0) or 0) > float(indicators.iloc[-offset - 1].get("close", 0) or 0):
+                rising += 1
+        total = len(rows)
+        if not total:
+            break
+        above_ma60 = sum(float(row.get("close", 0) or 0) > float(row.get("ma60", 0) or 0) for row in rows) / total
+        rising_ratio = rising / total
+        rows_by_offset.append(
+            {
+                "date": str(rows[0].get("date", ""))[:10],
+                "above_ma60_ratio": round(above_ma60, 4),
+                "rising_ratio": round(rising_ratio, 4),
+                "persistent": above_ma60 >= threshold and rising_ratio >= threshold,
+            }
+        )
+
+    consecutive = 0
+    for item in rows_by_offset:
+        if not item["persistent"]:
+            break
+        consecutive += 1
+    return consecutive, rows_by_offset
+
+
+def apply_market_opportunity(market: dict, snapshots_by_symbol: dict, settings: dict | None = None) -> dict:
+    """Add the V2.1 opportunity layer without changing index state or regime scoring."""
+    settings = settings or {}
+    metrics = market.get("market_regime_metrics", {}) or {}
+    rising_ratio = float(metrics.get("rising_ratio", 0) or 0)
+    above_ma60_ratio = float(metrics.get("above_ma60_ratio", 0) or 0)
+    risk_score = float(metrics.get("risk_score", 0) or 0)
+    style_rows = market.get("style_state_table", []) or []
+    strong_style_count = sum(
+        row.get("state") == "strong" and bool(row.get("strongest_eligible", False))
+        for row in style_rows
+    )
+    breadth_persistence_days, persistence_rows = _breadth_persistence(snapshots_by_symbol)
+
+    opportunity_score = (
+        min(rising_ratio / 0.55, 1.0) * 25
+        + min(above_ma60_ratio / 0.55, 1.0) * 25
+        + min(strong_style_count / 3.0, 1.0) * 20
+        + min(risk_score / 10.0, 1.0) * 15
+        + min(breadth_persistence_days / 3.0, 1.0) * 15
+    )
+    structural_market = (
+        rising_ratio >= 0.55
+        and above_ma60_ratio >= 0.55
+        and strong_style_count >= 1
+        and risk_score >= 7.0
+        and breadth_persistence_days >= 3
+    )
+    reasons = [
+        f"上涨比例 {rising_ratio:.1%}",
+        f"站上 MA60 比例 {above_ma60_ratio:.1%}",
+        f"高置信度强势风格数量 {strong_style_count}",
+        f"市场风险评分 {risk_score:.2f}/10",
+        f"市场广度持续 {breadth_persistence_days} 日",
+    ]
+
+    market["base_market_state"] = market.get("market_state", "unknown")
+    market["base_market_regime"] = market.get("market_regime", "")
+    market["structural_market"] = structural_market
+    market["market_opportunity_score"] = round(opportunity_score, 2)
+    market["market_opportunity_reason"] = reasons
+    market["strong_style_count"] = strong_style_count
+    market["breadth_persistence_days"] = breadth_persistence_days
+    market["breadth_persistence_table"] = persistence_rows
+
+    portfolio = dict(market.get("portfolio_mode", {}) or {})
+    if structural_market and portfolio.get("portfolio_mode") == "cash":
+        rule = get_position_rule(settings, "structural_market")
+        portfolio.update(
+            {
+                "final_portfolio_mode": "structural_market",
+                "portfolio_mode": "structural_market",
+                "max_total_position": rule["max_total_position"],
+                "allow_new_position": True,
+                "portfolio_mode_adjustment_reason": "指数环境偏弱，但市场广度、强势风格和风险指标满足结构性行情条件；组合模式调整为 structural_market。",
+            }
+        )
+    market["portfolio_mode"] = portfolio
+    return market
+
+
 def _portfolio_mode(state: str, style_rows: list[dict], data_quality_level: str = "fresh", settings: dict | None = None) -> dict:
     settings = settings or {}
     regime = _regime_from_state(state)
@@ -185,6 +282,8 @@ def evaluate_market_state(
     return {
         "state": state,
         "market_state": regime,
+        "base_market_state": regime,
+        "base_market_regime": regime,
         "market_strength": strength,
         "label": label,
         "max_position": max_position,

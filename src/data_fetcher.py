@@ -57,20 +57,54 @@ def _normalize_spot_columns(df: pd.DataFrame) -> pd.DataFrame:
         "最新价": "price",
         "成交额": "amount",
         "涨跌幅": "pct_change",
+        "所属行业": "industry",
+        "行业": "industry",
     }
     out = df.rename(columns=column_map).copy()
-    for col in ["symbol", "name", "price", "amount"]:
+    for col in ["symbol", "name", "price", "amount", "industry"]:
         if col not in out.columns:
-            out[col] = pd.NA
+            out[col] = "未知行业" if col == "industry" else pd.NA
     out["symbol"] = out["symbol"].astype(str).str.zfill(6)
     out["price"] = pd.to_numeric(out["price"], errors="coerce")
     out["amount"] = pd.to_numeric(out["amount"], errors="coerce")
     return out.dropna(subset=["symbol", "name"])
 
 
-def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str]]) -> tuple[list[dict[str, str]], bool, str | None]:
+def _normalize_index_constituents(df: pd.DataFrame) -> set[str]:
+    for column in ["品种代码", "证券代码", "代码", "con_code", "symbol"]:
+        if column in df.columns:
+            return {
+                str(value).split(".")[0].zfill(6)
+                for value in df[column].dropna().tolist()
+                if str(value).strip()
+            }
+    return set()
+
+
+def _index_constituent_symbols(ak, index_code: str) -> set[str]:
+    try:
+        return _normalize_index_constituents(ak.index_stock_cons(symbol=index_code))
+    except Exception:
+        return set()
+
+
+def _pool_metadata(pool: list[dict], source: str, version: str) -> dict:
+    distribution: dict[str, int] = {}
+    for item in pool:
+        industry = str(item.get("industry") or "未知行业")
+        distribution[industry] = distribution.get(industry, 0) + 1
+    return {
+        "pool_version": version,
+        "pool_size": len(pool),
+        "pool_source": source,
+        "industry_distribution": dict(sorted(distribution.items())),
+    }
+
+
+def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str]]) -> tuple[list[dict[str, str]], bool, str | None, dict]:
+    version = str(settings.get("pool_version", "v2.1"))
     if settings.get("stock_pool_mode", "manual") != "main_board_all":
-        return fallback_pool, False, None
+        return fallback_pool, False, None, _pool_metadata(fallback_pool, "本地白名单", version)
     try:
         import akshare as ak
 
@@ -84,19 +118,47 @@ def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str
             & (spot["amount"] >= min_amount)
             & (spot["price"] * lot_size <= max_one_lot)
         ].copy()
-        filtered = filtered.sort_values("amount", ascending=False)
-        max_scan = int(settings.get("max_scan_symbols", 800))
-        filtered = filtered.head(max_scan)
-        pool = [{"symbol": row.symbol, "name": row.name} for row in filtered.itertuples(index=False)]
+        filtered = filtered.sort_values("amount", ascending=False).drop_duplicates("symbol")
+        hs300_symbols = _index_constituent_symbols(ak, "000300")
+        csi500_symbols = _index_constituent_symbols(ak, "000905")
+        indexed_symbols = hs300_symbols | csi500_symbols
+        max_scan = int(settings.get("max_scan_symbols", 500))
+
+        leaders = pd.DataFrame(columns=filtered.columns)
+        if "industry" in filtered.columns:
+            known_industry = filtered[filtered["industry"].notna() & (filtered["industry"] != "未知行业")]
+            if not known_industry.empty:
+                leaders = known_industry.groupby("industry", group_keys=False).head(1)
+        indexed = filtered[filtered["symbol"].isin(indexed_symbols)]
+        ordered = pd.concat([leaders, indexed, filtered], ignore_index=True).drop_duplicates("symbol").head(max_scan)
+        pool = []
+        for row in ordered.itertuples(index=False):
+            sources = []
+            if row.symbol in hs300_symbols:
+                sources.append("沪深300")
+            if row.symbol in csi500_symbols:
+                sources.append("中证500")
+            if str(getattr(row, "industry", "未知行业")) != "未知行业" and any(row.symbol == leader.symbol for leader in leaders.itertuples(index=False)):
+                sources.append("行业龙头")
+            if not sources:
+                sources.append("成交额筛选")
+            pool.append(
+                {
+                    "symbol": row.symbol,
+                    "name": row.name,
+                    "industry": str(getattr(row, "industry", "未知行业") or "未知行业"),
+                    "pool_source": "+".join(sources),
+                }
+            )
         if not pool:
             raise ValueError("full market prefilter returned empty pool")
         _write_stock_pool_cache(pool)
-        return pool, False, None
+        return pool, False, None, _pool_metadata(pool, "沪深300+中证500+主板行业龙头+成交额筛选", version)
     except Exception as exc:  # pragma: no cover - network fallback depends on environment
         cached = _read_stock_pool_cache()
         if cached:
-            return cached, True, str(exc)
-        return fallback_pool, True, str(exc)
+            return cached, True, str(exc), _pool_metadata(cached, "本地缓存股票池", version)
+        return fallback_pool, True, str(exc), _pool_metadata(fallback_pool, "本地备用白名单", version)
 
 
 def _stock_pool_cache_path() -> Path:
@@ -116,7 +178,15 @@ def _read_stock_pool_cache() -> list[dict[str, str]]:
     if df.empty:
         return []
     df["symbol"] = df["symbol"].astype(str).str.zfill(6)
-    return [{"symbol": row.symbol, "name": row.name} for row in df.itertuples(index=False)]
+    return [
+        {
+            "symbol": row.symbol,
+            "name": row.name,
+            "industry": str(getattr(row, "industry", "未知行业") or "未知行业"),
+            "pool_source": str(getattr(row, "pool_source", "本地缓存") or "本地缓存"),
+        }
+        for row in df.itertuples(index=False)
+    ]
 
 
 def _normalize_daily_columns(df: pd.DataFrame) -> pd.DataFrame:
