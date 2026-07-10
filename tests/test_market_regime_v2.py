@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
 
 from src.data_fetcher import FetchResult
 from src.market_regime import evaluate_market_regime
-from src.signals import generate_buy_signals
+from src.report import _serialize_gate_audit_rows
+from src.signals import build_candidate_gate_audit, generate_buy_signals
 from src.trading_decision import make_final_trade_decision
 from src.utils import load_config
 
@@ -169,6 +171,8 @@ def test_generate_signals_requires_final_action_buy():
     assert normal["candidates"][0]["final_action"] == "BUY"
     assert normal["candidates"][0]["position_multiplier"] == 0.7
     assert normal["candidates"][0]["estimated_amount"] <= 30000 * 0.25 * 0.7
+    assert normal["candidates"][0]["gate_pass"] is True
+    assert normal["candidates"][0]["decision_source"] == "normal_decision"
 
     wait_timing = {"600030": {"timing_decision": "WAIT", "structure_state": "pullback", "entry_quality_score": 68, "decision_confidence": 0.65, "timing_reason": "等待确认"}}
     waiting = generate_buy_signals(market("normal"), {"600030": frame()}, {"600030": "中信证券"}, {"600030": []}, settings(), RULES, timing_by_symbol=wait_timing)
@@ -272,14 +276,14 @@ def test_final_trade_permission_priority_for_no_candidate():
     assert signals["final_trade_permission"] == "暂无满足数据、时机和风控的正式候选"
 
 
-def test_runtime_profile_fast_is_applied():
+def test_runtime_profile_stable_is_applied_for_v21_broad_scan():
     loaded = load_config()["settings"]
-    assert loaded["runtime_profile"] == "fast"
-    assert loaded["max_scan_symbols"] == 120
-    assert loaded["data_fetch"]["request_interval_seconds"] == 0.3
-    assert loaded["data_fetch"]["batch_size"] == 30
-    assert loaded["data_fetch"]["batch_pause_seconds"] == 3
-    assert loaded["data_fetch"]["max_retries"] == 2
+    assert loaded["runtime_profile"] == "stable"
+    assert loaded["max_scan_symbols"] == 500
+    assert loaded["data_fetch"]["request_interval_seconds"] == 1.0
+    assert loaded["data_fetch"]["batch_size"] == 20
+    assert loaded["data_fetch"]["batch_pause_seconds"] == 8
+    assert loaded["data_fetch"]["max_retries"] == 3
 
 
 
@@ -404,3 +408,51 @@ def test_low_score_watchlist_keeps_minimum_score_and_audit_fields():
     assert "final_score=" in row["downgrade_reason"]
     assert "final_score=" in row["downgrade_reason"]
     assert row["final_trade_permission"] == signals["final_trade_permission"]
+
+
+def test_candidate_gate_audit_matches_pre_order_failure_and_serializes_json():
+    cfg = settings()
+    cfg["expected_trade_date"] = "2026-07-01"
+    candidate = {"timing_decision": "BUY", "final_action": "BUY"}
+    source_fields = {
+        "candidate_data_source": "cache",
+        "candidate_latest_date": "2026-07-01",
+        "is_expected_trade_date": True,
+    }
+    volume_check = {"has_trading_volume": True, "volume": 100, "amount": 1000, "reason": ""}
+    audit = build_candidate_gate_audit(candidate, None, market("normal"), source_fields, volume_check, cfg)
+
+    assert audit["gate_pass"] is False
+    assert any("fresh" in reason for reason in audit["gate_failed_reasons"])
+    assert audit["gate_checked_fields"]["account_risk_pass"] is None
+    assert audit["gate_checked_fields"]["suggested_lots"] is None
+
+    rendered = _serialize_gate_audit_rows([audit])[0]
+    assert isinstance(rendered["gate_failed_reasons"], str)
+    assert '"account_risk_pass": null' in rendered["gate_checked_fields_json"]
+    assert '"suggested_lots": null' in rendered["gate_checked_fields_json"]
+
+
+def test_cache_watchlist_row_keeps_gate_audit_and_permission():
+    timing = {"600030": {"timing_decision": "BUY", "structure_state": "breakout", "entry_quality_score": 82, "decision_confidence": 0.85}}
+    fetch = FetchResult(
+        "600030", "broker", frame(), True, final_source="cache",
+        latest_date="2026-07-01", effective_latest_date="2026-07-01",
+        expected_trade_date="2026-07-01", is_expected_trade_date=True,
+    )
+    cfg = settings()
+    cfg["expected_trade_date"] = "2026-07-01"
+    signals = generate_buy_signals(
+        market("normal"), {"600030": frame()}, {"600030": "broker"}, {"600030": []},
+        cfg, RULES, fetch_results_by_symbol={"600030": fetch}, timing_by_symbol=timing,
+    )
+    row = signals["watchlist"][0]
+    assert row["gate_pass"] is False
+    assert any("fresh" in reason for reason in row["gate_failed_reasons"])
+    assert row["final_trade_permission"] == signals["final_trade_permission"]
+
+
+def test_readme_documents_v2_candidate_gate_boundary():
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "V2 Candidate Gate" in readme
+    assert "本系统不会自动下单，不连接证券账户" in readme

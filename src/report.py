@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -44,10 +45,29 @@ def _sanitize_rows(rows):
     return _cn_text(rows)
 
 
+def _serialize_gate_audit_rows(rows):
+    """Convert gate audit containers into stable Markdown/CSV-safe values."""
+    serialized = []
+    for row in rows:
+        item = row.copy()
+        failed_reasons = item.get("gate_failed_reasons", [])
+        if isinstance(failed_reasons, (list, tuple)):
+            item["gate_failed_reasons"] = "；".join(str(reason) for reason in failed_reasons if reason)
+        elif failed_reasons is None:
+            item["gate_failed_reasons"] = ""
+        checked_fields = item.get("gate_checked_fields", {})
+        if isinstance(checked_fields, dict):
+            item["gate_checked_fields_json"] = json.dumps(checked_fields, ensure_ascii=False, sort_keys=True)
+        else:
+            item["gate_checked_fields_json"] = item.get("gate_checked_fields_json", "")
+        serialized.append(item)
+    return serialized
+
+
 def _markdown_table(rows: list[dict], columns: list[str]) -> str:
     if not rows:
         return "无\n"
-    rows = _sanitize_rows(rows)
+    rows = _sanitize_rows(_serialize_gate_audit_rows(rows))
     df = pd.DataFrame(rows)
     for col in columns:
         if col not in df.columns:
@@ -89,10 +109,10 @@ def write_reports(
     md_path = REPORT_DIR / f"{date}_daily_signal.md"
     csv_path = REPORT_DIR / f"{date}_daily_signal.csv"
 
-    candidates = signals["candidates"]
-    watchlist = signals["watchlist"]
+    candidates = _serialize_gate_audit_rows(signals["candidates"])
+    watchlist = _serialize_gate_audit_rows(signals["watchlist"])
     forbidden = signals["forbidden"]
-    timing_avoid_list = signals.get("timing_avoid_list", [])
+    timing_avoid_list = _serialize_gate_audit_rows(signals.get("timing_avoid_list", []))
     data_issue_list = signals.get("data_issue_list") or settings.get("data_issue_list", [])
     portfolio = market.get("portfolio_mode", {})
     portfolio_mode = portfolio.get("portfolio_mode", "cash")
@@ -114,7 +134,7 @@ def write_reports(
         "style_rotation_bonus", "style_retreat_penalty", "retreat_risk",
         "structure_state", "entry_quality_score", "decision_confidence",
         "timing_decision", "timing_reason", "trend_strong", "timing_risk_tag",
-        "final_action", "position_multiplier", "final_reason", "market_regime", "market_score",
+        "final_action", "decision_source", "gate_pass", "gate_failed_reasons", "gate_checked_fields_json", "position_multiplier", "final_reason", "market_regime", "market_score",
         "market_strength", "data_integrity_score", "confidence_position_multiplier",
         "candidate_data_source", "candidate_latest_date", "candidate_raw_latest_date", "is_expected_trade_date",
         "volume", "amount", "data_source_name", "fallback_source_used", "source_attempts_summary",
@@ -130,7 +150,7 @@ def write_reports(
         "trend_stop_price", "trend_exit_action", "account_risk_pct", "mode_account_risk_limit",
         "account_risk_pass", "structure_state", "entry_quality_score", "decision_confidence",
         "timing_decision", "timing_reason", "trend_strong", "timing_risk_tag",
-        "final_action", "position_multiplier", "final_reason", "market_regime", "market_score",
+        "final_action", "decision_source", "gate_pass", "gate_failed_reasons", "gate_checked_fields_json", "position_multiplier", "final_reason", "market_regime", "market_score",
         "account_risk_note", "take_profit_reduce_price",
         "take_profit_strong_price", "reason", "risk_note",
     ]
@@ -144,11 +164,16 @@ def write_reports(
         f"- 数据更新时间：{settings.get('generated_at') or ''}",
         f"- 是否使用缓存数据：{'是' if used_cache else '否'}",
         f"- market_state：{market.get('market_state', 'unknown')}",
+        f"- 基础市场状态：{market.get('base_market_state', market.get('market_state', 'unknown'))}",
+        f"- 基础市场环境：{market.get('base_market_regime', market.get('market_regime', 'unknown'))}",
+        f"- 结构性机会状态：{'是' if market.get('structural_market') else '否'}",
+        f"- 市场机会评分：{market.get('market_opportunity_score', '')}",
+        f"- 市场风险评分：{(market.get('market_regime_metrics', {}) or {}).get('risk_score', '')}",
         f"- market_regime：{market.get('market_regime', 'unknown')}",
         f"- market_score：{market.get('market_score', '')}",
         f"- market_trade_permission：{market.get('trade_permission', '')}",
         f"- market_strength：{market.get('market_strength', 0)}",
-        f"- portfolio_mode：{portfolio_mode}",
+        f"- 最终组合模式：{portfolio_mode}",
         f"- 交易权限：{trade_permission_text(portfolio_mode)}",
         f"- 今日总仓位建议：最高 {pct(max_position)}",
         f"- data_quality_level（兼容诊断项）：{data_quality_level}",
@@ -159,7 +184,7 @@ def write_reports(
         f"- confidence_reduced_mode：{confidence_reduced_mode}",
         f"- final_trade_permission：{signals.get('final_trade_permission', '')}",
         f"- final_trade_permission_reason：{'；'.join(signals.get('final_trade_permission_reason', []))}",
-        "- V2说明：数据完整性只降低置信度和建议金额，不直接决定交易开关；市场状态才是新开仓开关。",
+        "- V2说明：数据完整性只降低置信度和建议金额；若触发核心指数、交易日历、基础风控或大面积行情异常等关键阻断项，仍禁止正式新开仓。结构性机会层只调整组合模式，不覆盖基础指数状态或最终市场环境门控。",
         f"- market_data_ready_status：{settings.get('market_data_ready_status', 'unknown')}",
         f"- recommended_rerun_time：{settings.get('recommended_rerun_time', '')}",
         f"- ready_ratio：{settings.get('ready_ratio_text', '0/0 = 0.0%')}",
@@ -179,6 +204,25 @@ def write_reports(
         _markdown_table(
             [settings.get("performance_summary", {})],
             ["fetch_count", "indicator_compute_count", "index_indicator_compute_count", "snapshot_count", "valid_snapshot_count", "data_issue_count", "no_duplicate_io"],
+        ),
+        "",
+        "## 股票池摘要",
+        "",
+        _markdown_table(
+            settings.get("pool_layers", []),
+            ["pool", "size", "source"],
+        ),
+        "",
+        _markdown_table(
+            [{
+                "pool_version": settings.get("pool_version", ""),
+                "pool_size": settings.get("pool_size", settings.get("scan_count", "")),
+                "pool_source": settings.get("pool_source", ""),
+                "industry_distribution": "；".join(
+                    f"{industry}:{count}" for industry, count in (settings.get("industry_distribution", {}) or {}).items()
+                ),
+            }],
+            ["pool_version", "pool_size", "pool_source", "industry_distribution"],
         ),
         "",
         _reason_list("trading_critical_reasons", settings.get("trading_critical_reasons", [])),
@@ -206,6 +250,27 @@ def write_reports(
         _markdown_table(
             [market.get("market_regime_metrics", {})],
             ["index_trend_score", "breadth_score", "activity_score", "risk_score", "above_ma20_ratio", "above_ma60_ratio", "rising_ratio", "amount_ratio", "limit_down_ratio", "abnormal_volatility_ratio", "shrinking_ratio"],
+        ),
+        "",
+        "### market_opportunity",
+        "",
+        _markdown_table(
+            [{
+                "base_market_state": market.get("base_market_state", ""),
+                "base_market_regime": market.get("base_market_regime", ""),
+                "structural_market": market.get("structural_market", False),
+                "market_opportunity_score": market.get("market_opportunity_score", ""),
+                "strong_style_count": market.get("strong_style_count", ""),
+                "breadth_persistence_days": market.get("breadth_persistence_days", ""),
+                "risk_score": (market.get("market_regime_metrics", {}) or {}).get("risk_score", ""),
+                "market_opportunity_reason": "；".join(market.get("market_opportunity_reason", [])),
+            }],
+            ["base_market_state", "base_market_regime", "structural_market", "market_opportunity_score", "strong_style_count", "breadth_persistence_days", "risk_score", "market_opportunity_reason"],
+        ),
+        "",
+        _markdown_table(
+            market.get("breadth_persistence_table", []),
+            ["date", "above_ma60_ratio", "rising_ratio", "persistent"],
         ),
         "",
         "### market_index_table",
@@ -251,14 +316,14 @@ def write_reports(
         "",
         _markdown_table(
             watchlist,
-            ["symbol", "name", "best_style", "style_state", "final_score", "minimum_score", "base_signal_score", "signal_score", "style_momentum_score", "breadth_score", "style_rotation_bonus", "style_retreat_penalty", "retreat_risk", "structure_state", "entry_quality_score", "decision_confidence", "timing_decision", "final_action", "decision_source", "position_multiplier", "final_reason", "timing_reason", "trend_strong", "timing_risk_tag", "market_regime", "market_score", "market_strength", "portfolio_mode", "final_portfolio_mode", "raw_portfolio_mode", "data_integrity_score", "close_price", "candidate_data_source", "candidate_latest_date", "candidate_raw_latest_date", "is_expected_trade_date", "volume", "amount", "data_source_name", "fallback_source_used", "source_attempts_summary", "review_scope", "reason", "risk_note", "original_candidate_rank", "original_reason", "downgrade_reason", "original_account_risk_pct", "mode_account_risk_limit", "account_risk_pass", "original_estimated_amount", "final_trade_permission", "final_trade_permission_reason"],
+            ["symbol", "name", "best_style", "style_state", "final_score", "minimum_score", "base_signal_score", "signal_score", "style_momentum_score", "breadth_score", "style_rotation_bonus", "style_retreat_penalty", "retreat_risk", "structure_state", "entry_quality_score", "decision_confidence", "timing_decision", "final_action", "decision_source", "gate_pass", "gate_failed_reasons", "gate_checked_fields_json", "position_multiplier", "final_reason", "timing_reason", "trend_strong", "timing_risk_tag", "market_regime", "market_score", "market_strength", "portfolio_mode", "final_portfolio_mode", "raw_portfolio_mode", "data_integrity_score", "close_price", "candidate_data_source", "candidate_latest_date", "candidate_raw_latest_date", "is_expected_trade_date", "volume", "amount", "data_source_name", "fallback_source_used", "source_attempts_summary", "review_scope", "reason", "risk_note", "original_candidate_rank", "original_reason", "downgrade_reason", "original_account_risk_pct", "mode_account_risk_limit", "account_risk_pass", "original_estimated_amount", "final_trade_permission", "final_trade_permission_reason"],
         ),
         "",
         "## 交易时机规避名单",
         "",
         _markdown_table(
             timing_avoid_list,
-            ["symbol", "name", "best_style", "style_state", "final_score", "minimum_score", "structure_state", "entry_quality_score", "decision_confidence", "timing_decision", "final_action", "decision_source", "position_multiplier", "final_reason", "timing_reason", "trend_strong", "timing_risk_tag", "market_regime", "market_score", "portfolio_mode", "final_portfolio_mode", "raw_portfolio_mode", "candidate_data_source", "candidate_latest_date", "candidate_raw_latest_date", "is_expected_trade_date", "volume", "amount", "review_scope", "reason", "downgrade_reason", "final_trade_permission", "final_trade_permission_reason"],
+            ["symbol", "name", "best_style", "style_state", "final_score", "minimum_score", "structure_state", "entry_quality_score", "decision_confidence", "timing_decision", "final_action", "decision_source", "gate_pass", "gate_failed_reasons", "gate_checked_fields_json", "position_multiplier", "final_reason", "timing_reason", "trend_strong", "timing_risk_tag", "market_regime", "market_score", "portfolio_mode", "final_portfolio_mode", "raw_portfolio_mode", "candidate_data_source", "candidate_latest_date", "candidate_raw_latest_date", "is_expected_trade_date", "volume", "amount", "review_scope", "reason", "downgrade_reason", "final_trade_permission", "final_trade_permission_reason"],
         ),
         "",
         "## 数据问题名单 data_issue_list",
@@ -324,6 +389,10 @@ def write_reports(
                 "trend_strong": candidate.get("trend_strong", ""),
                 "timing_risk_tag": candidate.get("timing_risk_tag", ""),
                 "final_action": candidate.get("final_action", ""),
+                "decision_source": candidate.get("decision_source", ""),
+                "gate_pass": candidate.get("gate_pass", ""),
+                "gate_failed_reasons": candidate.get("gate_failed_reasons", ""),
+                "gate_checked_fields_json": candidate.get("gate_checked_fields_json", ""),
                 "position_multiplier": candidate.get("position_multiplier", ""),
                 "final_reason": _cn_text(candidate.get("final_reason", "")),
                 "market_regime": candidate.get("market_regime", ""),
@@ -381,6 +450,10 @@ def write_reports(
                 "trend_strong": "",
                 "timing_risk_tag": "",
                 "final_action": "",
+                "decision_source": "",
+                "gate_pass": "",
+                "gate_failed_reasons": "",
+                "gate_checked_fields_json": "",
                 "position_multiplier": "",
                 "final_reason": "",
                 "market_regime": "",
@@ -419,7 +492,7 @@ def write_reports(
         "date", "action", "symbol", "name", "rank", "score", "signal_score", "market_strength",
         "data_integrity_score", "confidence_position_multiplier", "best_style", "style_state",
         "structure_state", "entry_quality_score", "decision_confidence", "timing_decision",
-        "timing_reason", "trend_strong", "timing_risk_tag", "final_action", "position_multiplier",
+        "timing_reason", "trend_strong", "timing_risk_tag", "final_action", "decision_source", "gate_pass", "gate_failed_reasons", "gate_checked_fields_json", "position_multiplier",
         "final_reason", "market_regime", "market_score",
         "candidate_data_source", "candidate_latest_date", "candidate_raw_latest_date", "is_expected_trade_date", "volume", "amount", "data_source_name",
         "fallback_source_used", "source_attempts_summary", "close_price", "trigger_price",

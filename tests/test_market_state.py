@@ -1,7 +1,8 @@
 import pandas as pd
+from types import SimpleNamespace
 
 from src.data_quality import compute_data_quality_report
-from src.market_state import evaluate_market_state
+from src.market_state import apply_market_opportunity, evaluate_market_state
 from src.signals import evaluate_holdings, generate_buy_signals
 from src.styles import identify_best_style
 from src.position_rules import operation_summary
@@ -141,6 +142,59 @@ def test_partial_or_critical_cache_does_not_change_portfolio_mode():
     critical = evaluate_market_state(frame(100, 95, 90), stocks, RULES, names, set(stocks), market_index_table=market_index_table, data_quality_level="critical_cache")
     assert partial["portfolio_mode"]["portfolio_mode"] == critical["portfolio_mode"]["portfolio_mode"]
     assert partial["portfolio_mode"]["portfolio_mode_adjustment_reason"] == "无"
+
+
+def _persistent_snapshot(symbol: str, name: str):
+    rows = []
+    for index, close in enumerate([99, 100, 101, 102]):
+        rows.append(
+            {
+                "date": f"2026-07-0{index + 1}",
+                "close": close,
+                "ma60": 95,
+                "ma20": 98,
+                "amount": 800_000_000,
+            }
+        )
+    return SimpleNamespace(symbol=symbol, name=name, usable_for_signal=True, indicators=pd.DataFrame(rows))
+
+
+def test_structural_market_changes_portfolio_not_base_market_or_regime():
+    snapshots = {
+        "600030": _persistent_snapshot("600030", "中信证券"),
+        "600276": _persistent_snapshot("600276", "恒瑞医药"),
+    }
+    market = {
+        "market_state": "bear",
+        "market_regime": "cash",
+        "market_regime_metrics": {"rising_ratio": 0.60, "above_ma60_ratio": 0.60, "risk_score": 8.0},
+        "style_state_table": [{"style": "medicine_innovation_drug", "state": "strong", "strongest_eligible": True}],
+        "portfolio_mode": {"portfolio_mode": "cash", "raw_portfolio_mode": "cash", "final_portfolio_mode": "cash"},
+    }
+    result = apply_market_opportunity(market, snapshots, settings())
+    assert result["market_state"] == "bear"
+    assert result["market_regime"] == "cash"
+    assert result["base_market_state"] == "bear"
+    assert result["base_market_regime"] == "cash"
+    assert result["structural_market"] is True
+    assert result["breadth_persistence_days"] == 3
+    assert result["portfolio_mode"]["raw_portfolio_mode"] == "cash"
+    assert result["portfolio_mode"]["portfolio_mode"] == "structural_market"
+    assert result["portfolio_mode"]["max_total_position"] == 0.40
+
+
+def test_structural_market_requires_all_five_conditions():
+    snapshots = {"600030": _persistent_snapshot("600030", "中信证券")}
+    market = {
+        "market_state": "bear",
+        "market_regime": "cash",
+        "market_regime_metrics": {"rising_ratio": 0.60, "above_ma60_ratio": 0.60, "risk_score": 6.9},
+        "style_state_table": [{"style": "finance_brokerage", "state": "strong", "strongest_eligible": True}],
+        "portfolio_mode": {"portfolio_mode": "cash", "raw_portfolio_mode": "cash", "final_portfolio_mode": "cash"},
+    }
+    result = apply_market_opportunity(market, snapshots, settings())
+    assert result["structural_market"] is False
+    assert result["portfolio_mode"]["portfolio_mode"] == "cash"
 
 
 def test_same_style_allows_only_one_candidate():

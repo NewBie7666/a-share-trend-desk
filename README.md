@@ -55,3 +55,22 @@ symbol,name,quantity,cost_price,buy_date,stop_loss_price,take_profit_price,note
 ## 风险声明
 
 本系统仅提供量化研究信号，不构成投资建议或收益承诺。系统不会替用户登录证券账户、提交委托、撤单或自动交易。所有实盘操作必须由用户本人确认并承担结果。
+
+## V2 Candidate Gate
+
+正式买入候选必须同时满足以下准入条件：
+
+- `portfolio_mode != cash`
+- `market_regime != cash`
+- `timing_decision == BUY`
+- `final_action == BUY`
+- `candidate_data_source == fresh`
+- `candidate_latest_date == expected_trade_date`
+- `is_expected_trade_date == true`
+- `volume > 0` 且 `amount > 0`
+- `account_risk_pass == true`
+- `suggested_lots >= 1`
+
+任一条件不满足，股票只会进入观察名单或规避名单，并保留 Candidate Gate 的失败原因和已检查字段，便于复核。
+
+本系统不会自动下单，不连接证券账户；正式候选只是量化研究信号，不构成投资建议或收益承诺。

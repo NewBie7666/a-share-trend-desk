@@ -69,6 +69,7 @@ def build_condition_order(candidate: dict, settings: dict, rules: dict, rank: in
         "trend_strong": candidate.get("trend_strong", ""),
         "timing_risk_tag": candidate.get("timing_risk_tag", ""),
         "final_action": candidate.get("final_action", ""),
+        "decision_source": candidate.get("decision_source", ""),
         "position_multiplier": candidate.get("position_multiplier", ""),
         "final_reason": candidate.get("final_reason", ""),
         "market_strength": candidate.get("market_strength", 0),
@@ -206,6 +207,13 @@ def _normalize_observation(item: dict) -> dict:
     out.setdefault("volume", "")
     out.setdefault("amount", "")
     out.setdefault("minimum_score", "")
+    out.setdefault("gate_pass", False)
+    out.setdefault("gate_failed_reasons", [])
+    out.setdefault("gate_checked_fields", {})
+    out.setdefault("gate_checked_fields_json", "")
+    out.setdefault("blocker_codes", [])
+    out.setdefault("blocker_source", "")
+    out.setdefault("blocker_severity", "")
     out.setdefault("final_trade_permission", "")
     out.setdefault("final_trade_permission_reason", "")
     return out
@@ -344,7 +352,52 @@ def validate_final_candidate(candidate: dict, order: dict, market: dict, source_
     return not reasons, reasons
 
 
-def _candidate_review_row(candidate: dict, *, review_scope: str, downgrade_reasons: list[str], source_fields: dict | None = None, volume_check: dict | None = None, order: dict | None = None, market: dict | None = None) -> dict:
+def build_candidate_gate_audit(
+    candidate: dict,
+    order: dict | None,
+    market: dict,
+    source_fields: dict,
+    volume_check: dict,
+    settings: dict,
+    *,
+    pre_validation: tuple[bool, list[str]] | None = None,
+    final_validation: tuple[bool, list[str]] | None = None,
+) -> dict:
+    """Record the actual candidate gate result without introducing a second gate."""
+    source_fields = source_fields or {}
+    volume_check = volume_check or {}
+    portfolio = (market.get("portfolio_mode", {}) or {}).get("portfolio_mode", "")
+    checked_fields = {
+        "portfolio_mode": portfolio,
+        "market_regime": market.get("market_regime"),
+        "timing_decision": candidate.get("timing_decision"),
+        "final_action": candidate.get("final_action"),
+        "candidate_data_source": source_fields.get("candidate_data_source"),
+        "candidate_latest_date": source_fields.get("candidate_latest_date"),
+        "expected_trade_date": settings.get("expected_trade_date"),
+        "is_expected_trade_date": source_fields.get("is_expected_trade_date"),
+        "volume": volume_check.get("volume"),
+        "amount": volume_check.get("amount"),
+        "has_trading_volume": volume_check.get("has_trading_volume"),
+        "account_risk_pass": order.get("account_risk_pass") if order is not None else None,
+        "suggested_lots": order.get("suggested_lots") if order is not None else None,
+    }
+    if final_validation is not None:
+        gate_pass, reasons = final_validation
+    elif pre_validation is not None:
+        gate_pass, reasons = pre_validation
+    elif order is None:
+        gate_pass, reasons = validate_pre_order_candidate(candidate, market, source_fields, volume_check, settings)
+    else:
+        gate_pass, reasons = validate_final_candidate(candidate, order, market, source_fields, volume_check, settings)
+    return {
+        "gate_pass": bool(gate_pass),
+        "gate_failed_reasons": list(reasons),
+        "gate_checked_fields": checked_fields,
+    }
+
+
+def _candidate_review_row(candidate: dict, *, review_scope: str, downgrade_reasons: list[str], source_fields: dict | None = None, volume_check: dict | None = None, order: dict | None = None, market: dict | None = None, gate_audit: dict | None = None) -> dict:
     row = candidate.copy()
     source_fields = source_fields or {}
     volume_check = volume_check or {}
@@ -373,6 +426,12 @@ def _candidate_review_row(candidate: dict, *, review_scope: str, downgrade_reaso
     row["portfolio_mode"] = row.get("portfolio_mode") or portfolio.get("portfolio_mode", "")
     row["final_portfolio_mode"] = row.get("final_portfolio_mode") or portfolio.get("final_portfolio_mode", portfolio.get("portfolio_mode", ""))
     row["raw_portfolio_mode"] = row.get("raw_portfolio_mode") or portfolio.get("raw_portfolio_mode", portfolio.get("portfolio_mode", ""))
+    if gate_audit:
+        row.update(gate_audit)
+    else:
+        row["gate_pass"] = False
+        row["gate_failed_reasons"] = list(downgrade_reasons)
+        row["gate_checked_fields"] = {}
     return row
 
 
@@ -534,12 +593,12 @@ def generate_buy_signals(
         if style.strip() and style.strip() not in {"none", "无", "鏃?"}
     }
 
+    portfolio_mode = market.get("portfolio_mode", {}).get("portfolio_mode", "cash")
     market_state = market.get("market_state") or {"green": "bull", "yellow": "neutral", "red": "bear"}.get(market.get("state"), "unknown")
-    if market_state in {"bear", "unknown"}:
+    if market_state in {"bear", "unknown"} and portfolio_mode != "structural_market":
         result = {"candidates": [], "watchlist": [_normalize_observation(item) for item in ranked[:5]], "forbidden": forbidden, "data_issue_list": data_issue_list}
         return _finalize_signal_result(result, market, settings)
 
-    portfolio_mode = market.get("portfolio_mode", {}).get("portfolio_mode", "cash")
     effective_portfolio_mode = portfolio_mode
     market_regime = market.get("market_regime")
     rule = get_position_rule(settings, effective_portfolio_mode)
@@ -571,12 +630,17 @@ def generate_buy_signals(
 
     if critical_blocker["blocked"]:
         watch = [
-            _candidate_review_row(
-                item,
-                review_scope="candidate_data_review",
-                downgrade_reasons=critical_blocker["blocker_reasons"] or critical_blocker["blocker_codes"],
-                market=market,
-            )
+            _normalize_observation({
+                **_candidate_review_row(
+                    item,
+                    review_scope="candidate_data_review",
+                    downgrade_reasons=critical_blocker["blocker_reasons"] or critical_blocker["blocker_codes"],
+                    market=market,
+                ),
+                "blocker_codes": critical_blocker["blocker_codes"],
+                "blocker_source": critical_blocker["blocker_source"],
+                "blocker_severity": critical_blocker["blocker_severity"],
+            })
             for item in ranked[:8]
         ]
         result = {"candidates": [], "watchlist": [_normalize_observation(item) for item in watch], "forbidden": forbidden, "style_explanations": [], "data_issue_list": data_issue_list, "timing_avoid_list": []}
@@ -674,6 +738,10 @@ def generate_buy_signals(
         volume_check = _latest_trading_volume_check(candidate["symbol"], stock_frames)
         pre_ok, pre_reasons = validate_pre_order_candidate(candidate, market, source_fields, volume_check, settings)
         if not pre_ok:
+            gate_audit = build_candidate_gate_audit(
+                candidate, None, market, source_fields, volume_check, settings,
+                pre_validation=(pre_ok, pre_reasons),
+            )
             watchlist.append(
                 _candidate_review_row(
                     candidate,
@@ -682,6 +750,7 @@ def generate_buy_signals(
                     source_fields=source_fields,
                     volume_check=volume_check,
                     market=market,
+                    gate_audit=gate_audit,
                 )
             )
             continue
@@ -694,6 +763,10 @@ def generate_buy_signals(
         order["account_risk_pass"] = order["account_risk_pct"] <= mode_account_risk_limit
         final_ok, final_reasons = validate_final_candidate(candidate, order, market, source_fields, volume_check, settings)
         if not final_ok:
+            gate_audit = build_candidate_gate_audit(
+                candidate, order, market, source_fields, volume_check, settings,
+                final_validation=(final_ok, final_reasons),
+            )
             watchlist.append(
                 _candidate_review_row(
                     candidate,
@@ -703,6 +776,7 @@ def generate_buy_signals(
                     volume_check=volume_check,
                     order=order,
                     market=market,
+                    gate_audit=gate_audit,
                 )
             )
             if style in strongest_styles:
@@ -715,6 +789,12 @@ def generate_buy_signals(
         order.update(source_fields)
         order["volume"] = volume_check.get("volume", "")
         order["amount"] = volume_check.get("amount", "")
+        order.update(
+            build_candidate_gate_audit(
+                candidate, order, market, source_fields, volume_check, settings,
+                final_validation=(final_ok, final_reasons),
+            )
+        )
         selected.append(order)
         remaining_amount -= order["estimated_amount"]
         style_counts[style] = style_counts.get(style, 0) + 1
