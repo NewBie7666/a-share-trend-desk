@@ -159,28 +159,29 @@ def _persistent_snapshot(symbol: str, name: str):
     return SimpleNamespace(symbol=symbol, name=name, usable_for_signal=True, indicators=pd.DataFrame(rows))
 
 
-def test_structural_market_changes_portfolio_not_base_market_or_regime():
+def test_structural_opportunity_adjusts_to_defensive_without_overriding_market_regime():
     snapshots = {
         "600030": _persistent_snapshot("600030", "中信证券"),
         "600276": _persistent_snapshot("600276", "恒瑞医药"),
     }
     market = {
         "market_state": "bear",
-        "market_regime": "cash",
+            "market_regime": "defensive",
         "market_regime_metrics": {"rising_ratio": 0.60, "above_ma60_ratio": 0.60, "risk_score": 8.0},
         "style_state_table": [{"style": "medicine_innovation_drug", "state": "strong", "strongest_eligible": True}],
         "portfolio_mode": {"portfolio_mode": "cash", "raw_portfolio_mode": "cash", "final_portfolio_mode": "cash"},
     }
-    result = apply_market_opportunity(market, snapshots, settings())
+    result = apply_market_opportunity(market, snapshots, settings({"market_condition_confirm_days": 1, "expected_trade_date": "2099-01-01"}))
     assert result["market_state"] == "bear"
-    assert result["market_regime"] == "cash"
+    assert result["market_regime"] == "defensive"
     assert result["base_market_state"] == "bear"
-    assert result["base_market_regime"] == "cash"
+    assert result["base_market_regime"] == "defensive"
     assert result["structural_market"] is True
     assert result["breadth_persistence_days"] == 3
     assert result["portfolio_mode"]["raw_portfolio_mode"] == "cash"
-    assert result["portfolio_mode"]["portfolio_mode"] == "structural_market"
-    assert result["portfolio_mode"]["max_total_position"] == 0.40
+    assert result["market_condition"] == "structural_opportunity"
+    assert result["portfolio_mode"]["portfolio_mode"] == "defensive"
+    assert result["portfolio_mode"]["max_total_position"] == 0.30
 
 
 def test_structural_market_requires_all_five_conditions():

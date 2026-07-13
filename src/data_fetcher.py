@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 import random
 import time
@@ -101,24 +102,81 @@ def _pool_metadata(pool: list[dict], source: str, version: str) -> dict:
     }
 
 
+def _spot_provider_result(ak, source: str, expected_date: str) -> tuple[pd.DataFrame, dict]:
+    started = time.perf_counter()
+    try:
+        raw = ak.stock_zh_a_spot_em() if source == "akshare_eastmoney_spot" else ak.stock_zh_a_spot()
+        return _normalize_spot_columns(raw), {
+            "source": source,
+            "status": "success",
+            "latency": round(time.perf_counter() - started, 3),
+            "symbol_count": len(raw),
+            "raw_count": len(raw),
+            "symbol_valid_count": 0,
+            "main_board_count": 0,
+            "st_filter_count": 0,
+            "liquidity_filter_count": 0,
+            "final_count": 0,
+            "pass_ratio": 0.0,
+            "schema_quality": 1.0,
+            "data_quality": "fresh",
+            "latest_trade_date": expected_date,
+            "data_role": "stock_basic",
+        }
+    except Exception as exc:  # pragma: no cover - depends on remote provider
+        return pd.DataFrame(), {
+            "source": source,
+            "status": "failed",
+            "latency": round(time.perf_counter() - started, 3),
+            "symbol_count": 0,
+            "raw_count": 0,
+            "symbol_valid_count": 0,
+            "main_board_count": 0,
+            "st_filter_count": 0,
+            "liquidity_filter_count": 0,
+            "final_count": 0,
+            "pass_ratio": 0.0,
+            "schema_quality": 0.0,
+            "data_quality": "failed",
+            "latest_trade_date": "",
+            "data_role": "stock_basic",
+            "error": str(exc),
+        }
+
+
 def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str]]) -> tuple[list[dict[str, str]], bool, str | None, dict]:
     version = str(settings.get("pool_version", "v2.1"))
+    expected_date = str(settings.get("expected_trade_date", ""))
     if settings.get("stock_pool_mode", "manual") != "main_board_all":
         return fallback_pool, False, None, _pool_metadata(fallback_pool, "本地白名单", version)
     try:
         import akshare as ak
-
-        spot = _normalize_spot_columns(ak.stock_zh_a_spot_em())
+        providers: list[dict] = []
+        spot = pd.DataFrame()
+        for source in ["akshare_eastmoney_spot", "akshare_legacy_spot"]:
+            spot, provider = _spot_provider_result(ak, source, expected_date)
+            providers.append(provider)
+            if not spot.empty:
+                break
+        if spot.empty:
+            raise ConnectionError("; ".join(item.get("error", item["source"]) for item in providers))
         lot_size = int(settings.get("lot_size", 100))
         max_one_lot = float(settings.get("prefilter_max_one_lot_amount", settings.get("initial_cash", 30000)))
         min_amount = float(settings.get("prefilter_min_amount", settings.get("min_avg_amount_20d", 300000000)))
-        filtered = spot[
-            spot["symbol"].map(is_main_board_symbol)
-            & ~spot["name"].map(is_risk_stock_name)
-            & (spot["amount"] >= min_amount)
-            & (spot["price"] * lot_size <= max_one_lot)
-        ].copy()
+        main_board = spot[spot["symbol"].map(is_main_board_symbol)].copy()
+        after_st = main_board[~main_board["name"].map(is_risk_stock_name)].copy()
+        after_liquidity = after_st[after_st["amount"] >= min_amount].copy()
+        filtered = after_liquidity[(after_liquidity["price"] > 0) & (after_liquidity["price"] * lot_size <= max_one_lot)].copy()
         filtered = filtered.sort_values("amount", ascending=False).drop_duplicates("symbol")
+        provider = providers[-1]
+        provider.update({
+            "symbol_valid_count": len(spot),
+            "main_board_count": len(main_board),
+            "st_filter_count": len(after_st),
+            "liquidity_filter_count": len(after_liquidity),
+            "final_count": len(filtered),
+            "pass_ratio": round(len(filtered) / max(int(provider["raw_count"]), 1), 4),
+        })
         hs300_symbols = _index_constituent_symbols(ak, "000300")
         csi500_symbols = _index_constituent_symbols(ak, "000905")
         indexed_symbols = hs300_symbols | csi500_symbols
@@ -147,38 +205,103 @@ def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str
                     "symbol": row.symbol,
                     "name": row.name,
                     "industry": str(getattr(row, "industry", "未知行业") or "未知行业"),
+                    "price": float(getattr(row, "price", 0) or 0),
+                    "amount": float(getattr(row, "amount", 0) or 0),
+                    "turnover": float(getattr(row, "turnover", 0) or 0),
                     "pool_source": "+".join(sources),
                 }
             )
         if not pool:
             raise ValueError("full market prefilter returned empty pool")
-        _write_stock_pool_cache(pool)
-        return pool, False, None, _pool_metadata(pool, "沪深300+中证500+主板行业龙头+成交额筛选", version)
+        provider["final_count"] = len(pool)
+        _write_stock_pool_cache(pool, settings, "实时provider")
+        metadata = _pool_metadata(pool, "沪深300+中证500+主板行业龙头+成交额筛选", version)
+        metadata.update(
+            {
+                "providers": providers,
+                "pool_funnel": {
+                    "raw_count": int(providers[-1]["symbol_count"]),
+                    "main_board_count": len(main_board),
+                    "after_ST_filter": len(after_st),
+                    "after_liquidity_filter": len(after_liquidity),
+                    "after_data_filter": len(filtered),
+                    "final_scan_count": len(pool),
+                },
+                "pool_components": {
+                    "hs300": len(set(item["symbol"] for item in pool) & hs300_symbols),
+                    "csi500": len(set(item["symbol"] for item in pool) & csi500_symbols),
+                    "industry_leader": len(leaders),
+                    "liquidity_fill": len(pool),
+                },
+            }
+        )
+        return pool, False, None, metadata
     except Exception as exc:  # pragma: no cover - network fallback depends on environment
-        cached = _read_stock_pool_cache()
+        cached, cache_meta = _read_stock_pool_cache(settings)
         if cached:
-            return cached, True, str(exc), _pool_metadata(cached, "本地缓存股票池", version)
-        return fallback_pool, True, str(exc), _pool_metadata(fallback_pool, "本地备用白名单", version)
+            metadata = _pool_metadata(cached, "本地缓存股票池", version)
+            metadata.update({
+                "providers": [{"source": "local_cache", "status": "fallback", "latency": 0.0, "symbol_count": len(cached), "latest_trade_date": cache_meta.get("trade_date", ""), "data_role": "stock_basic", "error": str(exc)}],
+                "pool_funnel": {"raw_count": len(cached), "main_board_count": len(cached), "after_ST_filter": len(cached), "after_liquidity_filter": len(cached), "after_data_filter": len(cached), "final_scan_count": len(cached)},
+                "pool_components": {"local_cache": len(cached)},
+                "cache_metadata": cache_meta,
+            })
+            return cached, True, str(exc), metadata
+        metadata = _pool_metadata(fallback_pool, "本地备用白名单", version)
+        metadata.update({
+            "providers": [{"source": "local_whitelist", "status": "fallback", "latency": 0.0, "symbol_count": len(fallback_pool), "latest_trade_date": "", "data_role": "stock_basic", "error": str(exc)}],
+            "pool_funnel": {"raw_count": len(fallback_pool), "main_board_count": len(fallback_pool), "after_ST_filter": len(fallback_pool), "after_liquidity_filter": len(fallback_pool), "after_data_filter": len(fallback_pool), "final_scan_count": len(fallback_pool)},
+            "pool_components": {"local_whitelist": len(fallback_pool)},
+            "cache_metadata": cache_meta,
+        })
+        return fallback_pool, True, str(exc), metadata
 
 
 def _stock_pool_cache_path() -> Path:
+    return CACHE_DIR / "main_board_pool_cache.json"
+
+
+def _legacy_stock_pool_cache_path() -> Path:
     return CACHE_DIR / "main_board_pool.csv"
 
 
-def _write_stock_pool_cache(pool: list[dict[str, str]]) -> None:
+def _write_stock_pool_cache(pool: list[dict[str, str]], settings: dict | None = None, source: str = "") -> None:
     ensure_directories()
-    pd.DataFrame(pool).to_csv(_stock_pool_cache_path(), index=False, encoding="utf-8-sig")
+    cfg = (settings or {}).get("pool_cache", {}) or {}
+    payload = {
+        "cache_version": int(cfg.get("cache_version", 1)),
+        "filter_version": str(cfg.get("filter_version", "v2.1-pr3")),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "trade_date": str((settings or {}).get("expected_trade_date", "")),
+        "symbol_count": len(pool),
+        "records": pool,
+    }
+    _stock_pool_cache_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _read_stock_pool_cache() -> list[dict[str, str]]:
+def _read_stock_pool_cache(settings: dict | None = None) -> tuple[list[dict], dict]:
     path = _stock_pool_cache_path()
-    if not path.exists():
-        return []
-    df = pd.read_csv(path, dtype={"symbol": str})
+    cfg = (settings or {}).get("pool_cache", {}) or {}
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            compatible = payload.get("cache_version") == int(cfg.get("cache_version", 1)) and payload.get("filter_version") == str(cfg.get("filter_version", "v2.1-pr3"))
+            created = datetime.fromisoformat(str(payload.get("created_at", "")))
+            age = (datetime.now() - created).days
+            if compatible:
+                return list(payload.get("records", [])), {"cache_age_days": age, "cache_compatible": True, **payload}
+            return [], {"cache_age_days": age, "cache_compatible": False, "reject_reason": "缓存版本或筛选版本不匹配"}
+        except (OSError, ValueError, json.JSONDecodeError):
+            return [], {"cache_compatible": False, "reject_reason": "缓存JSON不可读取"}
+    legacy = _legacy_stock_pool_cache_path()
+    if not legacy.exists():
+        return [], {"cache_compatible": False, "reject_reason": "缓存不存在"}
+    df = pd.read_csv(legacy, dtype={"symbol": str})
     if df.empty:
-        return []
+        return [], {"cache_compatible": False, "reject_reason": "旧缓存为空"}
     df["symbol"] = df["symbol"].astype(str).str.zfill(6)
-    return [
+    records = [
         {
             "symbol": row.symbol,
             "name": row.name,
@@ -187,6 +310,7 @@ def _read_stock_pool_cache() -> list[dict[str, str]]:
         }
         for row in df.itertuples(index=False)
     ]
+    return records, {"cache_compatible": False, "reject_reason": "仅发现旧CSV缓存，需实时provider刷新后迁移"}
 
 
 def _normalize_daily_columns(df: pd.DataFrame) -> pd.DataFrame:

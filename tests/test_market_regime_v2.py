@@ -276,14 +276,14 @@ def test_final_trade_permission_priority_for_no_candidate():
     assert signals["final_trade_permission"] == "暂无满足数据、时机和风控的正式候选"
 
 
-def test_runtime_profile_stable_is_applied_for_v21_broad_scan():
+def test_fast_fetch_profile_does_not_shrink_v21_broad_scan_pool():
     loaded = load_config()["settings"]
-    assert loaded["runtime_profile"] == "stable"
+    assert loaded["runtime_profile"] == "fast"
     assert loaded["max_scan_symbols"] == 500
-    assert loaded["data_fetch"]["request_interval_seconds"] == 1.0
-    assert loaded["data_fetch"]["batch_size"] == 20
-    assert loaded["data_fetch"]["batch_pause_seconds"] == 8
-    assert loaded["data_fetch"]["max_retries"] == 3
+    assert loaded["data_fetch"]["request_interval_seconds"] == 0.3
+    assert loaded["data_fetch"]["batch_size"] == 30
+    assert loaded["data_fetch"]["batch_pause_seconds"] == 3
+    assert loaded["data_fetch"]["max_retries"] == 2
 
 
 

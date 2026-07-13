@@ -15,12 +15,27 @@ allow_single_lot_above_position_limit: true
 stock_pool_mode: main_board_all
 prefilter_min_amount: 300000000
 prefilter_max_one_lot_amount: 30000
-runtime_profile: stable
+runtime_profile: fast
+fetch_profile: fast
 max_scan_symbols: 500
 scan_type: main_board_prefilter
-pool_version: v2.1
+pool_version: v2.1-pr3
+pool_definition:
+  universe_type: 沪深A股主板策略覆盖池
+  target_size: 500
+manual_supplement:
+  max_count: 50
+pool_cache:
+  cache_version: 1
+  filter_version: v2.1-pr3
+  max_age_days: 20
 analysis_pool_size: 150
 candidate_pool_size: 30
+scan_pool_max: 500
+analysis_pool_max: 150
+timing_pool_max: 30
+candidate_pool_max: 10
+market_condition_confirm_days: 3
 account_risk_limit: 0.025
 max_same_style_candidates: 1
 style_state_source: confirmed_style_pool
@@ -38,7 +53,6 @@ minimum_trade_guarantee:
   min_candidates: 0
 profiles:
   fast:
-    max_scan_symbols: 120
     data_fetch:
       request_interval_seconds: 0.3
       max_retries: 2
@@ -46,7 +60,6 @@ profiles:
       batch_size: 30
       batch_pause_seconds: 3
   stable:
-    max_scan_symbols: 500
     data_fetch:
       request_interval_seconds: 1.0
       max_retries: 3
@@ -72,12 +85,6 @@ position_rules:
     max_new_candidates: 1
     min_score: 78
     max_account_risk_pct: 0.015
-  structural_market:
-    max_total_position: 0.40
-    max_single_position: 0.20
-    max_new_candidates: 2
-    min_score: 78
-    max_account_risk_pct: 0.015
   cash:
     max_total_position: 0.00
     max_single_position: 0.00
@@ -97,6 +104,9 @@ data_fetch:
   consecutive_failure_soft_pause_seconds: 10
   consecutive_failure_hard_limit: 15
   min_history_days: 120
+runtime:
+  enable_runtime_cache: true
+  enable_stage_profile: true
 cache:
   max_cache_age_trade_days: 1
 daily_signal:

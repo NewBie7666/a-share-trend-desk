@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pandas as pd
 
 from .position_rules import get_position_rule
 from .styles import build_style_state_table
 from .snapshots import snapshot_fetch_results, snapshot_names, snapshots_to_frames
+from .utils import CACHE_DIR, ensure_directories
 
 
 def _index_state(close: float, ma20: float, ma60: float) -> str:
@@ -88,6 +92,64 @@ def _breadth_persistence(snapshots_by_symbol: dict, threshold: float = 0.55) -> 
     return consecutive, rows_by_offset
 
 
+def _opportunity_state_path() -> Path:
+    return CACHE_DIR / "market_opportunity_state.json"
+
+
+def _load_opportunity_state() -> dict:
+    path = _opportunity_state_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_opportunity_state(state: dict) -> None:
+    ensure_directories()
+    _opportunity_state_path().write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _opportunity_level(score: float) -> str:
+    if score < 30:
+        return "poor"
+    if score < 60:
+        return "normal"
+    if score < 80:
+        return "favorable"
+    return "strong"
+
+
+def _update_opportunity_state(
+    *,
+    current_date: str,
+    conditions: dict[str, bool],
+    confirm_days: int,
+) -> dict:
+    previous = _load_opportunity_state()
+    all_passed = all(conditions.values())
+    previous_date = str(previous.get("last_updated", ""))[:10]
+    previous_count = int(previous.get("confirm_days", 0) or 0)
+    if all_passed:
+        confirm_count = previous_count if previous_date == current_date else previous_count + 1
+        first_confirmed = previous.get("first_confirmed_date")
+        if confirm_count >= confirm_days and not first_confirmed:
+            first_confirmed = current_date
+    else:
+        confirm_count = 0
+        first_confirmed = None
+    state = {
+        "confirm_days": confirm_count,
+        "first_confirmed_date": first_confirmed,
+        "last_updated": current_date,
+        "conditions": conditions,
+        "confirmed": all_passed and confirm_count >= confirm_days,
+    }
+    _save_opportunity_state(state)
+    return state
+
+
 def apply_market_opportunity(market: dict, snapshots_by_symbol: dict, settings: dict | None = None) -> dict:
     """Add the V2.1 opportunity layer without changing index state or regime scoring."""
     settings = settings or {}
@@ -109,13 +171,13 @@ def apply_market_opportunity(market: dict, snapshots_by_symbol: dict, settings: 
         + min(risk_score / 10.0, 1.0) * 15
         + min(breadth_persistence_days / 3.0, 1.0) * 15
     )
-    structural_market = (
-        rising_ratio >= 0.55
-        and above_ma60_ratio >= 0.55
-        and strong_style_count >= 1
-        and risk_score >= 7.0
-        and breadth_persistence_days >= 3
-    )
+    conditions = {
+        "rising_ratio": rising_ratio >= 0.55,
+        "above_ma60_ratio": above_ma60_ratio >= 0.55,
+        "strong_style_count": strong_style_count >= 1,
+        "risk_score": risk_score >= 7.0,
+        "breadth_persistence": breadth_persistence_days >= 3,
+    }
     reasons = [
         f"上涨比例 {rising_ratio:.1%}",
         f"站上 MA60 比例 {above_ma60_ratio:.1%}",
@@ -124,27 +186,66 @@ def apply_market_opportunity(market: dict, snapshots_by_symbol: dict, settings: 
         f"市场广度持续 {breadth_persistence_days} 日",
     ]
 
+    fail_reasons = [reason for key, reason in zip(conditions, reasons) if not conditions[key]]
+    confirm_days = int(settings.get("market_condition_confirm_days", 3))
+    current_date = str(settings.get("expected_trade_date", "")) or "unknown"
+    opportunity_state = _update_opportunity_state(
+        current_date=current_date,
+        conditions=conditions,
+        confirm_days=confirm_days,
+    )
+    structural_opportunity = bool(opportunity_state["confirmed"])
+    market["raw_market_state"] = market.get("market_state", "unknown")
     market["base_market_state"] = market.get("market_state", "unknown")
     market["base_market_regime"] = market.get("market_regime", "")
-    market["structural_market"] = structural_market
+    market["structural_market"] = structural_opportunity
+    market["structural_opportunity"] = structural_opportunity
+    market["market_condition"] = "structural_opportunity" if structural_opportunity else "normal"
     market["market_opportunity_score"] = round(opportunity_score, 2)
+    market["market_opportunity_level"] = _opportunity_level(opportunity_score)
     market["market_opportunity_reason"] = reasons
+    market["structural_trigger_conditions"] = conditions
+    market["structural_fail_reasons"] = fail_reasons
     market["strong_style_count"] = strong_style_count
     market["breadth_persistence_days"] = breadth_persistence_days
     market["breadth_persistence_table"] = persistence_rows
+    market["market_condition_state"] = opportunity_state
 
     portfolio = dict(market.get("portfolio_mode", {}) or {})
-    if structural_market and portfolio.get("portfolio_mode") == "cash":
-        rule = get_position_rule(settings, "structural_market")
+    raw_mode = portfolio.get("raw_portfolio_mode", portfolio.get("portfolio_mode", "cash"))
+    data_block = bool(settings.get("trading_critical_blocker_codes", []))
+    if data_block:
+        cash_reason = "data_block"
+    elif raw_mode == "cash":
+        cash_reason = "market_risk"
+    else:
+        cash_reason = "unknown"
+    market_regime = market.get("market_regime", "")
+    adjustment_reason = "无"
+    if structural_opportunity and raw_mode == "cash" and cash_reason == "market_risk" and market_regime != "cash":
+        rule = get_position_rule(settings, "defensive")
         portfolio.update(
             {
-                "final_portfolio_mode": "structural_market",
-                "portfolio_mode": "structural_market",
+                "final_portfolio_mode": "defensive",
+                "portfolio_mode": "defensive",
                 "max_total_position": rule["max_total_position"],
                 "allow_new_position": True,
-                "portfolio_mode_adjustment_reason": "指数环境偏弱，但市场广度、强势风格和风险指标满足结构性行情条件；组合模式调整为 structural_market。",
+                "portfolio_mode_adjustment_reason": "结构性机会已连续确认，且不存在数据阻断；原始 cash 按防守仓位调整为 defensive。",
             }
         )
+        adjustment_reason = portfolio["portfolio_mode_adjustment_reason"]
+    elif structural_opportunity and raw_mode == "cash":
+        adjustment_reason = "结构性机会已确认，但 market_regime=cash 或数据阻断存在，组合模式维持 cash。"
+        portfolio["portfolio_mode_adjustment_reason"] = adjustment_reason
+    market["portfolio_cash_reason"] = cash_reason
+    market["portfolio_decision_chain"] = {
+        "data_block": data_block,
+        "market_regime": market_regime,
+        "raw_portfolio_mode": raw_mode,
+        "market_condition": market["market_condition"],
+        "final_portfolio_mode": portfolio.get("portfolio_mode", raw_mode),
+        "adjustment_reason": adjustment_reason,
+    }
     market["portfolio_mode"] = portfolio
     return market
 

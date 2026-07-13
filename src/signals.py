@@ -71,6 +71,7 @@ def build_condition_order(candidate: dict, settings: dict, rules: dict, rank: in
         "final_action": candidate.get("final_action", ""),
         "decision_source": candidate.get("decision_source", ""),
         "position_multiplier": candidate.get("position_multiplier", ""),
+        "final_position_multiplier": candidate.get("final_position_multiplier", ""),
         "final_reason": candidate.get("final_reason", ""),
         "market_strength": candidate.get("market_strength", 0),
         "market_regime": candidate.get("market_regime", ""),
@@ -248,6 +249,60 @@ def _apply_final_decision_fields(item: dict, decision: dict, market: dict) -> di
     item["final_portfolio_mode"] = portfolio.get("final_portfolio_mode", portfolio.get("portfolio_mode", ""))
     item["raw_portfolio_mode"] = portfolio.get("raw_portfolio_mode", portfolio.get("portfolio_mode", ""))
     return item
+
+
+def _reject_code(row: dict) -> str:
+    scope = str(row.get("review_scope", ""))
+    reason = str(row.get("downgrade_reason") or row.get("final_reason") or row.get("reason") or "")
+    if scope == "candidate_data_review" or any(token in reason for token in ["fresh", "交易日", "成交量", "成交额", "数据"]):
+        return "DATA_CANDIDATE_GATE"
+    if scope == "candidate_risk_review" or any(token in reason for token in ["风险", "一手", "仓位"]):
+        return "RISK_CANDIDATE_GATE"
+    if scope == "timing_review" or any(token in reason for token in ["timing", "时机", "final_action"]):
+        return "TIMING_DECISION"
+    if any(token in reason for token in ["风格", "分数"]):
+        return "STYLE_FILTER"
+    return "TECH_FILTER"
+
+
+def _attach_signal_funnel(result: dict, settings: dict, stock_frames: dict, filter_reasons: dict) -> dict:
+    pool_symbols = list(settings.get("candidate_pool_symbols", stock_frames.keys()))
+    technical = [symbol for symbol in pool_symbols if not filter_reasons.get(symbol)]
+    rows = result.get("watchlist", []) + result.get("timing_avoid_list", [])
+    rejected = {}
+    for row in rows:
+        symbol = str(row.get("symbol", "")).zfill(6)
+        rejected[symbol] = {"code": _reject_code(row), "reason": row.get("downgrade_reason") or row.get("final_reason") or row.get("reason", "")}
+    final_symbols = {str(row.get("symbol", "")).zfill(6) for row in result.get("candidates", [])}
+    timing_symbols = [symbol for symbol in technical if symbol not in rejected or rejected[symbol]["code"] not in {"TIMING_DECISION"}]
+    data_symbols = [symbol for symbol in timing_symbols if symbol not in rejected or rejected[symbol]["code"] not in {"DATA_CANDIDATE_GATE"}]
+    risk_symbols = [symbol for symbol in data_symbols if symbol not in rejected or rejected[symbol]["code"] not in {"RISK_CANDIDATE_GATE"}]
+    stages = [("pool", pool_symbols), ("technical", technical), ("style", technical), ("timing", timing_symbols), ("data", data_symbols), ("risk", risk_symbols), ("final_buy", list(final_symbols))]
+    funnel = {}
+    previous = len(pool_symbols)
+    for name, symbols in stages:
+        reasons = {}
+        for symbol, item in rejected.items():
+            if symbol not in symbols:
+                reasons[item["code"]] = reasons.get(item["code"], 0) + 1
+        funnel[name] = {"input_count": previous, "output_count": len(symbols), "reject_count": max(0, previous - len(symbols)), "reject_reason": reasons}
+        previous = len(symbols)
+    trace = []
+    for symbol in settings.get("analysis_pool_symbols", []):
+        item = {"symbol": symbol, "stage_history": ["analysis_pool"], "entered_stage": "analysis_pool", "exited_stage": "final_buy" if symbol in final_symbols else ""}
+        if symbol not in settings.get("timing_pool_symbols", []):
+            item.update({"exited_stage": "timing_pool", "reject_code": "STYLE_POOL_LIMIT", "reject_reason": "未进入 timing_pool 上限范围"})
+        elif symbol not in pool_symbols:
+            item.update({"exited_stage": "candidate_pool", "reject_code": "STYLE_POOL_LIMIT", "reject_reason": "未进入 candidate_pool 上限范围"})
+        elif symbol in rejected:
+            item.update({"exited_stage": "candidate_gate", "reject_code": rejected[symbol]["code"], "reject_reason": rejected[symbol]["reason"]})
+        else:
+            item.update({"reject_code": "", "reject_reason": ""})
+        trace.append(item)
+    result["signal_funnel"] = funnel
+    result["funnel_trace"] = trace
+    result["why_no_buy"] = [] if final_symbols else [f"{code}:{count}" for code, count in funnel["final_buy"]["reject_reason"].items()]
+    return result
 
 
 def classify_trading_critical_blockers(settings: dict) -> dict:
@@ -581,6 +636,10 @@ def generate_buy_signals(
 ) -> dict:
     settings = dict(settings)
     settings.setdefault("data_quality_level", data_quality_level)
+    settings.setdefault(
+        "final_position_multiplier",
+        float((settings.get("data_integrity_report", {}) or {}).get("confidence_position_multiplier", settings.get("confidence_position_multiplier", 1.0)) or 1.0),
+    )
     forbidden = categorize_forbidden(filter_reasons, names)
     data_issue_list = _data_issue_list(fetch_results_by_symbol, names)
     ranked = _ranked_candidates(stock_frames, names, filter_reasons, market, settings, scores_by_symbol, timing_by_symbol)
@@ -609,8 +668,7 @@ def generate_buy_signals(
     holding_value = current_holding_market_value(holdings, stock_frames)
     available_new_amount = max(0.0, total_limit - holding_value)
     single_limit = settings["initial_cash"] * float(rule["max_single_position"])
-    confidence_multiplier = float((settings.get("data_integrity_report", {}) or {}).get("confidence_position_multiplier", settings.get("confidence_position_multiplier", 1.0)) or 1.0)
-    max_single_new_amount = min(single_limit, available_new_amount) * confidence_multiplier
+    max_single_new_amount = min(single_limit, available_new_amount)
     if available_new_amount <= 0:
         watch = []
         for item in ranked[:8]:
@@ -705,6 +763,7 @@ def generate_buy_signals(
         candidate = candidate.copy()
         decision = make_final_trade_decision(market_regime, candidate)
         _apply_final_decision_fields(candidate, decision, market)
+        candidate["final_position_multiplier"] = float(candidate.get("position_multiplier", 0) or 0) * float(settings.get("final_position_multiplier", 1.0) or 1.0)
         if "final_action" not in decision:
             watchlist.append(
                 _candidate_review_row(
@@ -755,8 +814,7 @@ def generate_buy_signals(
             )
             continue
 
-        market_position_multiplier = float(candidate.get("position_multiplier", 1.0) or 1.0)
-        raw_amount = min(max_single_new_amount, remaining_amount) * market_position_multiplier
+        raw_amount = min(max_single_new_amount, remaining_amount) * float(candidate.get("final_position_multiplier", 0) or 0)
         order = build_condition_order(candidate, settings, rules, rank=len(selected) + 1, raw_amount=raw_amount)
         mode_account_risk_limit = float(rule.get("max_account_risk_pct", settings.get("account_risk_limit", 0.025)))
         order["mode_account_risk_limit"] = mode_account_risk_limit
@@ -814,7 +872,7 @@ def generate_buy_signals(
         "data_issue_list": data_issue_list,
         "timing_avoid_list": [_normalize_observation(item) for item in timing_avoid_list[:20]],
     }
-    return _finalize_signal_result(result, market, settings)
+    return _attach_signal_funnel(_finalize_signal_result(result, market, settings), settings, stock_frames, filter_reasons)
 
 
 def generate_buy_signals_from_snapshots(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import json
 import sys
 
 try:
@@ -25,10 +26,14 @@ from .data_quality import compute_data_quality_report
 from .indicators import add_indicators
 from .market_regime import evaluate_market_regime
 from .market_state import apply_market_opportunity, evaluate_market_state_from_snapshots
-from .pool_layers import pool_metadata, select_analysis_pool, select_candidate_pool, subset_snapshots
+from .analysis_pool_selector import select_analysis_pool as select_basic_analysis_pool
+from .pool_layers import pool_metadata, select_candidate_pool, select_timing_pool, subset_snapshots
 from .report import write_reports
 from .signals import evaluate_holdings_from_snapshots, generate_buy_signals_from_snapshots
-from .snapshots import build_stock_snapshots, snapshot_data_issue_list
+from .runtime_cache import RuntimeCache
+from .runtime_profiler import RuntimeProfiler
+from .snapshots import build_stock_snapshots, compute_snapshot_timing, snapshot_data_issue_list
+from .system_health import evaluate_system_health
 from .utils import ensure_directories, load_config, load_holdings
 
 
@@ -281,8 +286,53 @@ def _cache_notes(stock_stats: dict, fetch_log_path, data_quality_level: str, tra
         notes.append(f"\u91cd\u8dd1\u5efa\u8bae\uff1a{stock_stats.get('rerun_suggestion')}")
     return notes
 
-def run_daily_signal() -> int:
+def _debug_output(settings: dict, market: dict, signals: dict) -> None:
+    sections = {
+        "A_market_opportunity": {
+            "portfolio_decision_chain": market.get("portfolio_decision_chain", {}),
+            "market_condition": market.get("market_condition", "normal"),
+            "market_opportunity_level": market.get("market_opportunity_level", ""),
+            "market_opportunity_score": market.get("market_opportunity_score", 0),
+            "structural_trigger_conditions": market.get("structural_trigger_conditions", {}),
+            "structural_fail_reasons": market.get("structural_fail_reasons", []),
+            "market_condition_state": market.get("market_condition_state", {}),
+        },
+        "B_pool_funnel": {
+            "pool_definition": settings.get("pool_definition", {}),
+            "pool_capacity": settings.get("pool_capacity", 0),
+            "pool_target": settings.get("pool_target", 0),
+            "pool_available": settings.get("pool_available", 0),
+            "coverage_ratio": settings.get("coverage_ratio", 0),
+            "universe_quality_score": settings.get("universe_quality_score", 0),
+            "pool_cache_metadata": settings.get("pool_cache_metadata", {}),
+            "providers": settings.get("pool_providers", []),
+            "pool_funnel": settings.get("pool_funnel", {}),
+            "pool_components": settings.get("pool_components", {}),
+            "pool_layers": settings.get("pool_layers", []),
+        },
+        "C_candidate_funnel": {
+            "system_health": settings.get("system_health", ""),
+            "health_reasons": settings.get("health_reasons", []),
+            "final_position_multiplier": settings.get("final_position_multiplier", 1.0),
+            "signal_funnel": signals.get("signal_funnel", {}),
+            "funnel_trace": signals.get("funnel_trace", []),
+            "why_no_buy": signals.get("why_no_buy", []),
+        },
+        "D_runtime": {
+            "runtime": settings.get("runtime_report", {}),
+            "runtime_cache": settings.get("runtime_cache_stats", {}),
+            "data_pipeline": settings.get("data_pipeline", {}),
+            "performance_budget": settings.get("performance_budget", {}),
+        },
+    }
+    console.print(json.dumps(sections, ensure_ascii=False, indent=2, default=str))
+
+
+def run_daily_signal(debug: bool = False) -> int:
     ensure_directories()
+    profiler = RuntimeProfiler()
+    runtime_cache = RuntimeCache()
+    profiler.start_stage("total")
     generated_at = datetime.now()
     report_date = generated_at.strftime("%Y-%m-%d")
     expected_date, trade_calendar_status, trade_dates = expected_trade_date(generated_at)
@@ -295,27 +345,58 @@ def run_daily_signal() -> int:
     settings["expected_trade_date"] = expected_date
     settings["trade_calendar_status"] = trade_calendar_status
 
+    profiler.start_stage("pool_loading")
     console.print("[bold]Step 1/5: loading stock pool...[/bold]")
     stock_pool, pool_used_cache, pool_error, scan_pool_meta = load_main_board_stock_pool(settings, config["stock_pool"])
     holdings = load_holdings()
     merged = {item["symbol"]: item for item in stock_pool}
-    for item in config["stock_pool"]:
+    supplement_limit = int((settings.get("manual_supplement", {}) or {}).get("max_count", 50))
+    supplement_added = 0
+    for item in config["stock_pool"][:supplement_limit]:
+        if item["symbol"] in merged:
+            continue
         merged.setdefault(item["symbol"], item)
-    stock_pool = list(merged.values())[: int(settings.get("max_scan_symbols", 500))]
+        supplement_added += 1
+    pool_target = int((settings.get("pool_definition", {}) or {}).get("target_size", settings.get("scan_pool_max", 500)))
+    pool_capacity = int(settings.get("scan_pool_max", settings.get("max_scan_symbols", 500)))
+    stock_pool = list(merged.values())[:pool_capacity]
     scan_pool_meta = pool_metadata(
         stock_pool,
         version=str(settings.get("pool_version", "v2.1")),
         source=scan_pool_meta.get("pool_source", ""),
     )
     settings["scan_count"] = len(stock_pool)
+    settings["pool_definition"] = settings.get("pool_definition", {"universe_type": "沪深A股主板策略覆盖池", "target_size": pool_target})
+    settings["pool_capacity"] = pool_capacity
+    settings["pool_target"] = pool_target
+    settings["pool_available"] = len(stock_pool)
+    settings["coverage_ratio"] = round(len(stock_pool) / pool_target, 4) if pool_target else 0.0
+    provider = (scan_pool_meta.get("providers", []) or [{}])[-1]
+    universe_quality_score = min(100.0, round(provider.get("schema_quality", 0) * 35 + (1 if provider.get("data_quality") == "fresh" else 0.5) * 35 + min(settings["coverage_ratio"], 1.0) * 30, 2))
+    settings["universe_quality_score"] = universe_quality_score
     settings.update(scan_pool_meta)
+    settings["pool_components"] = {**scan_pool_meta.get("pool_components", {}), "manual_whitelist_added": supplement_added}
+    settings["pool_funnel"] = {**scan_pool_meta.get("pool_funnel", {}), "final_scan_count": len(stock_pool)}
+    settings["pool_providers"] = scan_pool_meta.get("providers", [])
+    settings["pool_cache_metadata"] = scan_pool_meta.get("cache_metadata", {})
     settings["pool_layers"] = [{"pool": "scan_pool", "size": len(stock_pool), "source": scan_pool_meta.get("pool_source", "")}]
     names = {item["symbol"]: item["name"] for item in stock_pool}
+    analysis_symbols, analysis_reasons = select_basic_analysis_pool(
+        stock_pool, int(settings.get("analysis_pool_max", 150))
+    )
+    analysis_symbol_set = set(analysis_symbols)
+    analysis_pool = [item for item in stock_pool if str(item.get("symbol", "")).zfill(6) in analysis_symbol_set]
+    for item in stock_pool:
+        item["analysis_pool_reason"] = analysis_reasons.get(str(item.get("symbol", "")).zfill(6), "")
+    profiler.end_stage("pool_loading")
 
-    console.print(f"[bold]Step 2/5: fetching indices and daily bars, scan_count={len(stock_pool)}...[/bold]")
+    profiler.start_stage("provider_fetch")
+    console.print(f"[bold]Step 2/5: fetching indices and daily bars, analysis_count={len(analysis_pool)}...[/bold]")
     index_results = fetch_market_indices(expected_date, settings=settings)
     hs300_result = next(item["result"] for item in index_results if item["index_code"] == "000300")
-    stock_results = fetch_stocks(stock_pool, progress=True, settings=settings, expected_trade_date_value=expected_date, trade_dates=trade_dates)
+    stock_results = fetch_stocks(analysis_pool, progress=True, settings=settings, expected_trade_date_value=expected_date, trade_dates=trade_dates)
+    for result in stock_results:
+        runtime_cache.set_daily(expected_date, result.symbol, result)
     stock_results_by_symbol = {result.symbol: result for result in stock_results}
     stock_stats = summarize_stock_fetches(stock_results)
     holding_symbols = set(holdings["symbol"].astype(str).str.zfill(6)) if not holdings.empty else set()
@@ -333,6 +414,7 @@ def run_daily_signal() -> int:
     settings["rerun_suggestion"] = ready_report["rerun_suggestion"]
     settings["stock_fetch_stats"] = stock_stats
     fetch_log_path = write_fetch_failure_log(stock_results, report_date)
+    profiler.end_stage("provider_fetch")
 
     core_index_used_cache = any(item["core"] and (item["result"].final_source != "fresh" or not item["result"].is_expected_trade_date or item["result"].data.empty) for item in index_results)
     optional_index_failed = any((not item["core"]) and (item["result"].final_source != "fresh" or not item["result"].is_expected_trade_date or item["result"].data.empty) for item in index_results)
@@ -363,6 +445,18 @@ def run_daily_signal() -> int:
     settings["stock_basic_status"] = stock_basic_status
     settings["stock_basic_is_trading_critical"] = stock_basic_is_trading_critical
     settings["stock_basic_fallback_basis"] = _fallback_basis_rows(stock_basic_status, stock_basic_is_trading_critical)
+    blocker_codes = []
+    if core_index_used_cache:
+        blocker_codes.append("core_index_unavailable")
+    if trade_calendar_status == "failed":
+        blocker_codes.append("trade_calendar_failed")
+    if stock_basic_is_trading_critical:
+        blocker_codes.append("stock_basic_trading_critical")
+    if stock_stats.get("failed_count", 0) / max(stock_stats.get("total_symbols", 1), 1) > 0.05:
+        blocker_codes.append("broad_daily_data_failure")
+    if data_quality_level == "stale":
+        blocker_codes.append("stale_data")
+    settings["trading_critical_blocker_codes"] = sorted(set(blocker_codes))
     settings["data_issue_list"] = _data_issue_list(stock_results)
     settings["data_quality_summary"] = _build_data_quality_summary(
         core_index_used_cache=core_index_used_cache,
@@ -380,6 +474,7 @@ def run_daily_signal() -> int:
         console.print("[red]沪深300数据不可用，无法生成有效报告。[/red]")
         return 1
 
+    profiler.start_stage("snapshot_build")
     console.print("[bold]Step 3/5: calculating indicators and filters...[/bold]")
     hs300 = add_indicators(hs300_result.data)
     market_index_table = []
@@ -417,38 +512,70 @@ def run_daily_signal() -> int:
         settings,
         risk_rules,
         hs300,
+        runtime_cache=runtime_cache,
+        compute_timing=False,
     )
     performance_summary["index_indicator_compute_count"] = sum(1 for item in index_results if not item["result"].data.empty)
     settings["performance_summary"] = performance_summary
     settings["data_issue_list"] = snapshot_data_issue_list(snapshots_by_symbol)
 
-    analysis_symbols = select_analysis_pool(
-        stock_pool,
-        snapshots_by_symbol,
-        int(settings.get("analysis_pool_size", 150)),
-    )
     analysis_snapshots = subset_snapshots(snapshots_by_symbol, analysis_symbols)
-    candidate_symbols = select_candidate_pool(
+    timing_symbols = select_timing_pool(
         analysis_snapshots,
-        int(settings.get("candidate_pool_size", 30)),
+        int(settings.get("timing_pool_max", 30)),
     )
-    candidate_snapshots = subset_snapshots(analysis_snapshots, candidate_symbols)
-    analysis_pool = [item for item in stock_pool if str(item.get("symbol", "")).zfill(6) in set(analysis_symbols)]
-    candidate_pool = [item for item in analysis_pool if str(item.get("symbol", "")).zfill(6) in set(candidate_symbols)]
+    timing_snapshots = subset_snapshots(analysis_snapshots, timing_symbols)
+    profiler.end_stage("snapshot_build")
+    profiler.start_stage("timing_compute")
+    timing_compute_count = compute_snapshot_timing(timing_snapshots, runtime_cache)
+    profiler.end_stage("timing_compute")
+    candidate_symbols = select_candidate_pool(timing_snapshots, int(settings.get("candidate_pool_max", 10)))
+    candidate_snapshots = subset_snapshots(timing_snapshots, candidate_symbols)
+    timing_pool = [item for item in analysis_pool if str(item.get("symbol", "")).zfill(6) in set(timing_symbols)]
+    candidate_pool = [item for item in timing_pool if str(item.get("symbol", "")).zfill(6) in set(candidate_symbols)]
+    timing_reason_map = {symbol: ("score_top/trend_strength/sector_strength" if symbol in set(timing_symbols) else "score_rank_low/liquidity_low/industry_duplicate") for symbol in analysis_symbols}
+    for item in analysis_pool:
+        item["timing_selection_reason"] = timing_reason_map.get(str(item.get("symbol", "")).zfill(6), "")
     settings["pool_layers"] = [
         {"pool": "scan_pool", "size": len(stock_pool), "source": scan_pool_meta.get("pool_source", "")},
         {"pool": "analysis_pool", "size": len(analysis_pool), "source": "流动性排序并保留行业覆盖"},
-        {"pool": "candidate_pool", "size": len(candidate_pool), "source": "沿用现有评分排序"},
+        {"pool": "timing_pool", "size": len(timing_pool), "source": "现有评分排序后进入时机分析"},
+        {"pool": "candidate_pool", "size": len(candidate_pool), "source": "时机与 Candidate Gate 输入上限"},
     ]
     settings["analysis_pool_size"] = len(analysis_pool)
     settings["candidate_pool_size"] = len(candidate_pool)
+    settings["analysis_pool_symbols"] = analysis_symbols
+    settings["timing_pool_symbols"] = timing_symbols
+    settings["candidate_pool_symbols"] = candidate_symbols
+    settings["analysis_pool_selection"] = [{"symbol": item.get("symbol"), "name": item.get("name"), "analysis_pool_reason": item.get("analysis_pool_reason", "")} for item in stock_pool]
+    settings["timing_pool_selection"] = [{"symbol": item.get("symbol"), "name": item.get("name"), "timing_selection_reason": item.get("timing_selection_reason", "")} for item in analysis_pool]
+    performance_summary["timing_compute_count"] = timing_compute_count
+    performance_summary.update(runtime_cache.stats())
+    settings["performance_summary"] = performance_summary
+    settings["data_pipeline"] = {
+        "scan_pool": len(stock_pool), "analysis_pool": len(analysis_pool),
+        "daily_fetch_fresh": stock_stats.get("fresh_success_count", 0),
+        "daily_fetch_cache": stock_stats.get("cache_fallback_count", 0),
+        "daily_fetch_failed": stock_stats.get("failed_count", 0),
+        "timing_processed": timing_compute_count, "candidate_pool": len(candidate_pool),
+    }
     settings["industry_distribution"] = pool_metadata(
         stock_pool,
         version=str(settings.get("pool_version", "v2.1")),
         source=scan_pool_meta.get("pool_source", ""),
     )["industry_distribution"]
 
+    profiler.start_stage("signal_generation")
     console.print("[bold]Step 4/5: evaluating market state and signals...[/bold]")
+    provider_results = list(settings.get("pool_providers", []))
+    provider_results.append({"source": "daily_price", "status": "success" if stock_stats.get("fresh_success_count", 0) else "fallback", "latency": stock_stats.get("fetch_duration_seconds", 0), "symbol_count": stock_stats.get("total_symbols", 0), "latest_trade_date": market_data_date, "data_role": "daily_price"})
+    provider_results.extend({"source": item["index_code"], "status": "success" if item["result"].final_source == "fresh" else "fallback", "latency": 0.0, "symbol_count": 1, "latest_trade_date": item["result"].effective_latest_date or "", "data_role": "index"} for item in index_results)
+    provider_results.append({"source": "trade_calendar", "status": "success" if trade_calendar_status == "fresh" else "fallback", "latency": 0.0, "symbol_count": len(trade_dates), "latest_trade_date": expected_date, "data_role": "calendar"})
+    settings["provider_results"] = provider_results
+    health = evaluate_system_health(settings, provider_results)
+    settings.update(health)
+    settings["final_position_multiplier"] = health["health_position_multiplier"]
+
     market = evaluate_market_state_from_snapshots(
         hs300,
         analysis_snapshots,
@@ -461,6 +588,7 @@ def run_daily_signal() -> int:
     market.update(evaluate_market_regime(market_index_table, analysis_snapshots))
     market = apply_market_opportunity(market, analysis_snapshots, settings)
     signals = generate_buy_signals_from_snapshots(market, candidate_snapshots, settings, risk_rules, holdings, data_quality_level)
+    profiler.end_stage("signal_generation")
     temp_candidate_symbols = {
         str(item.get("symbol", "")).zfill(6)
         for item in signals.get("candidates", [])
@@ -482,12 +610,24 @@ def run_daily_signal() -> int:
     cache_notes.append(f"本次扫描股票数量：{len(stock_pool)}")
     holding_actions = evaluate_holdings_from_snapshots(holdings, snapshots_by_symbol, market, settings, risk_rules)
 
+    profiler.start_stage("report_generation")
     console.print("[bold]Step 5/5: writing reports...[/bold]")
+    profiler.end_stage("total")
+    runtime_report = profiler.get_runtime_report()
+    stages = {item["stage_name"]: item["elapsed_seconds"] for item in runtime_report["stages"]}
+    runtime_report["provider_bottleneck"] = stages.get("provider_fetch", 0) >= runtime_report["total_seconds"] * 0.8 if runtime_report["total_seconds"] else False
+    settings["runtime_report"] = runtime_report
+    settings["runtime_cache_stats"] = runtime_cache.stats()
+    settings["performance_budget"] = {"pool_loading": 5, "provider_fetch": 120, "snapshot_build": 20, "timing_compute": 5, "report_generation": 5}
     md_path, csv_path = write_reports(market, signals, holding_actions, used_cache, cache_notes, settings)
+    profiler.end_stage("report_generation")
+    settings["runtime_report"] = profiler.get_runtime_report()
 
     console.print(f"[bold]market_state:[/bold]{market['label']}")
     console.print(f"[bold]scan_count:[/bold]{len(stock_pool)}")
     console.print(f"[bold]buy_candidates:[/bold]{len(signals['candidates'])}")
+    if debug:
+        _debug_output(settings, market, signals)
     console.print(f"[bold]Markdown:[/bold]{md_path}")
     console.print(f"[bold]CSV:[/bold]{csv_path}")
     return 0
@@ -496,7 +636,8 @@ def run_daily_signal() -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="A-share main-board multi-style semi-auto signal system")
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("daily-signal", help="Generate daily complete-trade-date signal report")
+    daily = subparsers.add_parser("daily-signal", help="Generate daily complete-trade-date signal report")
+    daily.add_argument("--debug", action="store_true", help="Print market, pool and candidate funnel diagnostics")
     return parser
 
 
@@ -504,7 +645,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "daily-signal":
-        return run_daily_signal()
+        return run_daily_signal(debug=bool(args.debug))
     parser.print_help()
     return 1
 

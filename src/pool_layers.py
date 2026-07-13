@@ -54,7 +54,7 @@ def select_analysis_pool(
     return selected
 
 
-def select_candidate_pool(snapshots_by_symbol: dict, limit: int = 30) -> list[str]:
+def select_timing_pool(snapshots_by_symbol: dict, limit: int = 30) -> list[str]:
     """Rank only existing snapshot scores; hard filters remain owned by signals.py."""
     scored = []
     for symbol, snapshot in snapshots_by_symbol.items():
@@ -64,6 +64,10 @@ def select_candidate_pool(snapshots_by_symbol: dict, limit: int = 30) -> list[st
         scored.append((symbol, float(score.get("final_score", score.get("score", 0)) or 0)))
     scored.sort(key=lambda item: (-item[1], item[0]))
     return [symbol for symbol, _ in scored[:limit]]
+
+
+def select_candidate_pool(snapshots_by_symbol: dict, limit: int = 10) -> list[str]:
+    return select_timing_pool(snapshots_by_symbol, limit)
 
 
 def subset_snapshots(snapshots_by_symbol: dict, symbols: list[str]) -> dict:
