@@ -23,6 +23,7 @@ from .data_fetcher import (
     write_fetch_failure_log,
 )
 from .data_quality import compute_data_quality_report
+from .decision_log import write_daily_decision_log
 from .indicators import add_indicators
 from .market_regime import evaluate_market_regime
 from .market_state import apply_market_opportunity, evaluate_market_state_from_snapshots
@@ -35,6 +36,7 @@ from .runtime_profiler import RuntimeProfiler
 from .snapshots import build_stock_snapshots, compute_snapshot_timing, snapshot_data_issue_list
 from .system_health import evaluate_system_health
 from .utils import ensure_directories, load_config, load_holdings
+from .v3_signals import annotate_v3_holding_boundary, generate_v3_signals_from_snapshots
 
 
 console = Console()
@@ -324,11 +326,22 @@ def _debug_output(settings: dict, market: dict, signals: dict) -> None:
             "data_pipeline": settings.get("data_pipeline", {}),
             "performance_budget": settings.get("performance_budget", {}),
         },
+        "V3_decision": {
+            "decision_engine": settings.get("active_decision_engine", "v2"),
+            "v3_decision_funnel": signals.get("v3_decision_funnel", {}),
+            "v3_ranking": [
+                {
+                    key: row.get(key, "")
+                    for key in ("symbol", "name", "stock_factor_score", "timing_score", "market_score", "risk_adjustment", "total_score", "v3_action", "v3_reason")
+                }
+                for row in signals.get("ranked", [])
+            ],
+        },
     }
     console.print(json.dumps(sections, ensure_ascii=False, indent=2, default=str))
 
 
-def run_daily_signal(debug: bool = False) -> int:
+def run_daily_signal(debug: bool = False, engine: str | None = None) -> int:
     ensure_directories()
     profiler = RuntimeProfiler()
     runtime_cache = RuntimeCache()
@@ -339,6 +352,8 @@ def run_daily_signal(debug: bool = False) -> int:
 
     config = load_config()
     settings = config["settings"]
+    engine = engine or str((settings.get("decision_engine", {}) or {}).get("version", "v2"))
+    settings["active_decision_engine"] = engine
     risk_rules = config["risk_rules"]
     settings["generated_at"] = generated_at.strftime("%Y-%m-%d %H:%M:%S")
     settings["report_date"] = report_date
@@ -384,6 +399,11 @@ def run_daily_signal(debug: bool = False) -> int:
     analysis_symbols, analysis_reasons = select_basic_analysis_pool(
         stock_pool, int(settings.get("analysis_pool_max", 150))
     )
+    configured_analysis_limit = int(settings.get("analysis_pool_max", 150))
+    holding_symbols_for_pool = set(holdings["symbol"].astype(str).str.zfill(6)) if not holdings.empty else set()
+    available_symbols = {str(item.get("symbol", "")).zfill(6) for item in stock_pool}
+    prioritized_holdings = sorted(holding_symbols_for_pool & available_symbols)
+    analysis_symbols = (prioritized_holdings + [symbol for symbol in analysis_symbols if symbol not in holding_symbols_for_pool])[:configured_analysis_limit]
     analysis_symbol_set = set(analysis_symbols)
     analysis_pool = [item for item in stock_pool if str(item.get("symbol", "")).zfill(6) in analysis_symbol_set]
     for item in stock_pool:
@@ -587,7 +607,9 @@ def run_daily_signal(debug: bool = False) -> int:
     )
     market.update(evaluate_market_regime(market_index_table, analysis_snapshots))
     market = apply_market_opportunity(market, analysis_snapshots, settings)
-    signals = generate_buy_signals_from_snapshots(market, candidate_snapshots, settings, risk_rules, holdings, data_quality_level)
+    v2_signals = generate_buy_signals_from_snapshots(market, candidate_snapshots, settings, risk_rules, holdings, data_quality_level)
+    v3_signals = generate_v3_signals_from_snapshots(market, analysis_snapshots, settings, risk_rules, holdings)
+    signals = v3_signals if engine == "v3" else v2_signals
     profiler.end_stage("signal_generation")
     temp_candidate_symbols = {
         str(item.get("symbol", "")).zfill(6)
@@ -609,6 +631,10 @@ def run_daily_signal(debug: bool = False) -> int:
         cache_notes.append(f"股票基础信息使用缓存或备用池：{pool_error or '实时股票池不可用'}")
     cache_notes.append(f"本次扫描股票数量：{len(stock_pool)}")
     holding_actions = evaluate_holdings_from_snapshots(holdings, snapshots_by_symbol, market, settings, risk_rules)
+    if engine == "v3":
+        holding_actions = annotate_v3_holding_boundary(holding_actions, snapshots_by_symbol, settings, risk_rules)
+    decision_log_path = write_daily_decision_log(settings, v2_signals, v3_signals)
+    settings["daily_decision_log_path"] = str(decision_log_path)
 
     profiler.start_stage("report_generation")
     console.print("[bold]Step 5/5: writing reports...[/bold]")
@@ -638,6 +664,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
     daily = subparsers.add_parser("daily-signal", help="Generate daily complete-trade-date signal report")
     daily.add_argument("--debug", action="store_true", help="Print market, pool and candidate funnel diagnostics")
+    daily.add_argument("--engine", choices=("v2", "v3"), help="Select V2 gate engine or V3 scoring engine")
+    daily.add_argument("--v3-debug", action="store_true", help="Alias for --engine v3 --debug")
     return parser
 
 
@@ -645,7 +673,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "daily-signal":
-        return run_daily_signal(debug=bool(args.debug))
+        selected_engine = "v3" if bool(args.v3_debug) else args.engine
+        return run_daily_signal(debug=bool(args.debug or args.v3_debug), engine=selected_engine)
     parser.print_help()
     return 1
 

@@ -107,6 +107,27 @@ data_fetch:
 runtime:
   enable_runtime_cache: true
   enable_stage_profile: true
+decision_engine:
+  version: v3
+v3:
+  rule_version: v3.0.0
+  buy_threshold: 75
+  watch_threshold: 60
+  minimum_stock_factor_for_buy: 60
+  top_pool_size: 30
+  max_candidates: 3
+  risk_adjustment_max: 25
+  require_fresh_for_buy: true
+  extreme_risk_applies_to: new_position_only
+  weights:
+    stock_factor: 0.50
+    timing: 0.30
+    market: 0.20
+  structure_adjustment:
+    breakout: 10
+    pullback: 5
+    acceleration: 0
+    distribution: -20
 cache:
   max_cache_age_trade_days: 1
 daily_signal:

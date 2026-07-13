@@ -74,3 +74,19 @@ symbol,name,quantity,cost_price,buy_date,stop_loss_price,take_profit_price,note
 任一条件不满足，股票只会进入观察名单或规避名单，并保留 Candidate Gate 的失败原因和已检查字段，便于复核。
 
 本系统不会自动下单，不连接证券账户；正式候选只是量化研究信号，不构成投资建议或收益承诺。
+
+## V3 简化决策引擎
+
+V3 是与 V2 并行的新增开仓评分引擎，不删除或改写 V2：
+
+```bash
+python -m src.main daily-signal --engine v2
+python -m src.main daily-signal --engine v3
+python -m src.main daily-signal --engine v3 --debug
+```
+
+V3 使用个股因子、Timing、市场分和新增开仓风险扣分进行综合排序。`extreme_risk` 与
+`breakdown` 只限制新增开仓，不会改变已有持仓动作、止损价或触发卖出。
+
+每日 V2/V3 对比记录保存在 `data/logs/daily_decision/YYYY-MM-DD.json`。V3 规则版本
+`v3.0.0` 在验收后冻结，用于连续 30~60 个交易日的数据收集与后续回测。
