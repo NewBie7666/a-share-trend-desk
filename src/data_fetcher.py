@@ -12,6 +12,25 @@ import pandas as pd
 from .utils import CACHE_DIR, LOG_DIR, ensure_directories, ensure_holdings_file
 
 
+def _install_requests_default_timeout(timeout_seconds: float = 10.0) -> None:
+    """Apply a default timeout to third-party requests calls that omit one."""
+    import requests
+
+    session_cls = requests.sessions.Session
+    current = session_cls.request
+    if getattr(current, "_a_share_timeout_wrapper", False):
+        return
+
+    original = current
+
+    def request_with_timeout(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", timeout_seconds)
+        return original(self, method, url, **kwargs)
+
+    request_with_timeout._a_share_timeout_wrapper = True
+    session_cls.request = request_with_timeout
+
+
 @dataclass
 class FetchResult:
     symbol: str
@@ -150,7 +169,10 @@ def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str
     if settings.get("stock_pool_mode", "manual") != "main_board_all":
         return fallback_pool, False, None, _pool_metadata(fallback_pool, "本地白名单", version)
     try:
+        if settings.get("akshare_runtime_unavailable"):
+            raise ConnectionError("AkShare startup preflight timed out; use local stock-pool cache")
         import akshare as ak
+        _install_requests_default_timeout(float((settings.get("data_fetch", {}) or {}).get("network_timeout_seconds", 10)))
         providers: list[dict] = []
         spot = pd.DataFrame()
         for source in ["akshare_eastmoney_spot", "akshare_legacy_spot"]:
@@ -494,25 +516,29 @@ def _weekday_fallback(now: datetime) -> str:
     return day.strftime("%Y-%m-%d")
 
 
-def get_trade_calendar_dates() -> tuple[list[str], str]:
+def get_trade_calendar_dates(settings: dict | None = None) -> tuple[list[str], str]:
+    settings = settings if settings is not None else {}
+    cache_path = CACHE_DIR / "trade_calendar.json"
     try:
-        import akshare as ak
+        if cache_path.exists():
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            dates = payload.get("trade_dates", payload) if isinstance(payload, dict) else payload
+            dates = sorted(str(item) for item in dates if item)
+            if dates:
+                settings["trade_calendar_error"] = ""
+                settings["trade_calendar_source"] = "local_cache"
+                return dates, "fresh"
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        settings["trade_calendar_error"] = f"本地交易日历缓存不可用：{exc}"
+    settings.setdefault("trade_calendar_error", "本地交易日历缓存不存在，使用工作日规则推断")
+    settings["trade_calendar_source"] = "fallback_weekday"
+    return [], "fallback_weekday"
 
-        cal = ak.tool_trade_date_hist_sina()
-        if "trade_date" not in cal.columns:
-            raise ValueError("trade calendar missing trade_date")
-        dates = pd.to_datetime(cal["trade_date"], errors="coerce").dropna()
-        if dates.empty:
-            raise ValueError("trade calendar empty")
-        return sorted(d.strftime("%Y-%m-%d") for d in dates), "fresh"
-    except Exception:  # pragma: no cover - depends on network
-        return [], "fallback_weekday"
 
-
-def expected_trade_date(now: datetime | None = None, trade_dates: list[str] | None = None) -> tuple[str, str, list[str]]:
+def expected_trade_date(now: datetime | None = None, trade_dates: list[str] | None = None, settings: dict | None = None) -> tuple[str, str, list[str]]:
     now = now or datetime.now()
     if trade_dates is None:
-        trade_dates, status = get_trade_calendar_dates()
+        trade_dates, status = get_trade_calendar_dates(settings)
     else:
         status = "fresh"
     if not trade_dates:
@@ -694,10 +720,11 @@ def _read_valid_cache(
     return _make_result(symbol, name, df, final_source="cache", expected_trade_date_value=expected_trade_date_value, error=last_error, error_category=categorize_error(last_error), attempt_logs=attempt_logs, attempt_count=attempt_count, last_error=last_error, fallback_reason=fallback_reason, fetch_started_at=fetch_started_at, fetch_finished_at=fetch_finished_at, data_source_name="local_cache", source_attempts=source_attempts, min_history_days=min_history_days)
 
 
-def _fetch_stock_source(source_name: str, symbol: str, start_date: str, end_date: str, fetcher=None) -> pd.DataFrame:
+def _fetch_stock_source(source_name: str, symbol: str, start_date: str, end_date: str, fetcher=None, network_timeout: float = 10.0) -> pd.DataFrame:
     if fetcher is not None and source_name == "injected":
         return fetcher(symbol=symbol, start_date=start_date, end_date=end_date)
     import akshare as ak
+    _install_requests_default_timeout(network_timeout)
 
     if source_name == "akshare_eastmoney":
         return ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
@@ -706,8 +733,9 @@ def _fetch_stock_source(source_name: str, symbol: str, start_date: str, end_date
     raise ValueError(f"unsupported stock daily source: {source_name}")
 
 
-def _fetch_index_source(source_name: str, index_code: str, ak_symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+def _fetch_index_source(source_name: str, index_code: str, ak_symbol: str, start_date: str, end_date: str, network_timeout: float = 10.0) -> pd.DataFrame:
     import akshare as ak
+    _install_requests_default_timeout(network_timeout)
 
     if source_name == "akshare_sina":
         raw = ak.stock_zh_index_daily(symbol=ak_symbol)
@@ -746,6 +774,7 @@ def fetch_stock_daily(
     jitter_seconds = float(fetch_cfg.get("jitter_seconds", 0) or 0)
     max_cache_age = int(cache_cfg.get("max_cache_age_trade_days", 1))
     min_history_days = int(fetch_cfg.get("min_history_days", 120))
+    network_timeout = float(fetch_cfg.get("network_timeout_seconds", 10) or 10)
     start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
     end_date = datetime.now().strftime("%Y%m%d")
     attempt_logs: list[dict] = []
@@ -753,6 +782,22 @@ def fetch_stock_daily(
     last_error = ""
     fetch_started_at = _now_text()
     attempt_count = 0
+    if settings.get("akshare_runtime_unavailable") and fetcher is None and not source_fetchers:
+        return _read_valid_cache(
+            symbol,
+            name,
+            expected_trade_date_value=expected_trade_date_value,
+            max_cache_age_trade_days=max_cache_age,
+            trade_dates=trade_dates,
+            last_error="AkShare startup preflight timed out",
+            attempt_logs=attempt_logs,
+            attempt_count=0,
+            fetch_started_at=fetch_started_at,
+            fetch_finished_at=_now_text(),
+            cache_reader=cache_reader,
+            min_history_days=min_history_days,
+            source_attempts=source_attempts,
+        )
     if fetcher is not None:
         source_names = ["injected"]
     else:
@@ -765,7 +810,7 @@ def fetch_stock_daily(
         for attempt in range(1, max_retries + 2):
             attempt_count += 1
             try:
-                raw = source_fetcher(symbol=symbol, start_date=start_date, end_date=end_date) if source_fetcher else _fetch_stock_source(source_name, symbol, start_date, end_date, fetcher=fetcher)
+                raw = source_fetcher(symbol=symbol, start_date=start_date, end_date=end_date) if source_fetcher else _fetch_stock_source(source_name, symbol, start_date, end_date, fetcher=fetcher, network_timeout=network_timeout)
                 df = _normalize_daily_columns(raw).tail(days)
                 _validate_daily(df)
                 result = _make_result(
@@ -851,19 +896,22 @@ def fetch_index_daily(
     fetch_cfg = settings.get("data_fetch", {}) or {}
     source_cfg = ((settings.get("data_sources", {}) or {}).get("index_daily", {}) or {})
     min_history_days = int(fetch_cfg.get("min_history_days", 120))
+    network_timeout = float(fetch_cfg.get("network_timeout_seconds", 10) or 10)
     path = _generic_index_cache_path(index_code)
     start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
     end_date = datetime.now().strftime("%Y%m%d")
     primary = source_cfg.get("primary", "akshare_sina")
     fallbacks = list(source_cfg.get("fallback", ["akshare_eastmoney", "akshare_tencent", "local_cache"]) or [])
     source_names = [primary] + [item for item in fallbacks if item != primary and item != "local_cache"]
+    if settings.get("akshare_runtime_unavailable") and not source_fetchers:
+        source_names = []
     source_attempts: list[dict] = []
     attempt_logs: list[dict] = []
-    last_error = ""
+    last_error = "AkShare startup preflight timed out" if not source_names else ""
     for source_name in source_names:
         try:
             fetcher = (source_fetchers or {}).get(source_name)
-            raw = fetcher(index_code=index_code, ak_symbol=ak_symbol, start_date=start_date, end_date=end_date) if fetcher else _fetch_index_source(source_name, index_code, ak_symbol, start_date, end_date)
+            raw = fetcher(index_code=index_code, ak_symbol=ak_symbol, start_date=start_date, end_date=end_date) if fetcher else _fetch_index_source(source_name, index_code, ak_symbol, start_date, end_date, network_timeout=network_timeout)
             df = _normalize_daily_columns(raw).tail(days)
             _validate_daily(df, "index")
             result = _make_result(

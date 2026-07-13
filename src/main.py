@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+if __name__ == "__main__":
+    print("Startup: loading Python dependencies...", flush=True)
+
 import argparse
 from datetime import datetime
 import json
@@ -348,10 +351,17 @@ def run_daily_signal(debug: bool = False, engine: str | None = None) -> int:
     profiler.start_stage("total")
     generated_at = datetime.now()
     report_date = generated_at.strftime("%Y-%m-%d")
-    expected_date, trade_calendar_status, trade_dates = expected_trade_date(generated_at)
-
     config = load_config()
     settings = config["settings"]
+    if not bool((settings.get("data_fetch", {}) or {}).get("enable_akshare", True)):
+        settings["akshare_runtime_unavailable"] = True
+        console.print("[yellow]AkShare remote providers are disabled; using local caches for this run.[/yellow]")
+    console.print("[bold]Startup: loading local trade calendar...[/bold]")
+    expected_date, trade_calendar_status, trade_dates = expected_trade_date(generated_at, settings=settings)
+    if trade_calendar_status != "fresh":
+        console.print(
+            f"[yellow]Trade calendar fallback active: {settings.get('trade_calendar_error') or 'weekday fallback'}[/yellow]"
+        )
     engine = engine or str((settings.get("decision_engine", {}) or {}).get("version", "v2"))
     settings["active_decision_engine"] = engine
     risk_rules = config["risk_rules"]

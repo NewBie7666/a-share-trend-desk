@@ -1,4 +1,5 @@
 from datetime import datetime
+import json
 
 import pandas as pd
 
@@ -36,6 +37,72 @@ def multi_daily_df(dates):
             "amount": [500_000_000 for _ in dates],
         }
     )
+
+
+def test_missing_local_trade_calendar_falls_back_without_remote_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_fetcher, "CACHE_DIR", tmp_path)
+    settings = {}
+    dates, status = data_fetcher.get_trade_calendar_dates(settings)
+    assert dates == []
+    assert status == "fallback_weekday"
+    assert settings["trade_calendar_source"] == "fallback_weekday"
+
+
+def test_local_trade_calendar_cache_is_used(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_fetcher, "CACHE_DIR", tmp_path)
+    payload = ["2026-07-09", "2026-07-10"]
+    (tmp_path / "trade_calendar.json").write_text(json.dumps({"trade_dates": payload}), encoding="utf-8")
+    settings = {}
+    dates, status = data_fetcher.get_trade_calendar_dates(settings)
+    assert dates == payload
+    assert status == "fresh"
+    assert settings["trade_calendar_source"] == "local_cache"
+    assert settings["trade_calendar_error"] == ""
+
+
+def test_akshare_preflight_timeout_uses_stock_cache_without_remote_fetch(monkeypatch):
+    local_settings = {
+        "akshare_runtime_unavailable": True,
+        "data_fetch": {"max_retries": 2, "min_history_days": 1},
+        "cache": {"max_cache_age_trade_days": 1},
+    }
+    called = []
+
+    def forbidden_fetcher(*args, **kwargs):
+        called.append(True)
+        raise AssertionError("remote source must not run after AkShare preflight timeout")
+
+    monkeypatch.setattr(data_fetcher, "_fetch_stock_source", forbidden_fetcher)
+
+    result = fetch_stock_daily(
+        "600001",
+        "测试股份",
+        settings=local_settings,
+        expected_trade_date_value="2026-07-10",
+        trade_dates=["2026-07-10"],
+        cache_reader=lambda symbol: long_daily_df("2026-07-10"),
+    )
+    assert called == []
+    assert result.final_source == "cache"
+    assert result.effective_latest_date == "2026-07-10"
+
+
+def test_requests_timeout_wrapper_adds_default_but_preserves_explicit_timeout(monkeypatch):
+    import requests
+
+    calls = []
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            calls.append(kwargs.get("timeout"))
+            return object()
+
+    monkeypatch.setattr(requests.sessions, "Session", FakeSession)
+    data_fetcher._install_requests_default_timeout(7)
+    session = FakeSession()
+    session.request("GET", "https://example.invalid")
+    session.request("GET", "https://example.invalid", timeout=2)
+    assert calls == [7, 2]
 
 
 def long_daily_df(end_date="2026-07-01", periods=130):
