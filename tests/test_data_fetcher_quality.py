@@ -636,27 +636,87 @@ def test_market_data_ready_zero_ratio_network_is_source_unavailable():
 
 def test_fetch_stats_attempt_distribution_and_rerun_suggestion_for_network_cache_ratio():
     results = [
-        FetchResult("600001", "A", daily_df(), False, final_source="fresh", latest_date="2026-07-01", expected_trade_date="2026-07-01", is_expected_trade_date=True, success_attempt=1, fetch_started_at="2026-07-02 09:00:00", fetch_finished_at="2026-07-02 09:00:01"),
-        FetchResult("600002", "B", daily_df(), False, final_source="fresh", latest_date="2026-07-01", expected_trade_date="2026-07-01", is_expected_trade_date=True, success_attempt=2, fetch_started_at="2026-07-02 09:00:01", fetch_finished_at="2026-07-02 09:00:03"),
-        FetchResult("600003", "C", daily_df(), False, final_source="fresh", latest_date="2026-07-01", expected_trade_date="2026-07-01", is_expected_trade_date=True, success_attempt=3, fetch_started_at="2026-07-02 09:00:03", fetch_finished_at="2026-07-02 09:00:06"),
-        FetchResult("600004", "D", daily_df(), False, final_source="fresh", latest_date="2026-07-01", expected_trade_date="2026-07-01", is_expected_trade_date=True, success_attempt=4, fetch_started_at="2026-07-02 09:00:06", fetch_finished_at="2026-07-02 09:00:10"),
+        FetchResult("600001", "A", daily_df(), False, final_source="fresh", latest_date="2026-07-01", expected_trade_date="2026-07-01", is_expected_trade_date=True, success_attempt=1, data_source_name="primary", attempt_logs=[{"source_name":"primary","attempt":1,"final_source":"fresh"}], fetch_started_at="2026-07-02 09:00:00", fetch_finished_at="2026-07-02 09:00:01"),
+        FetchResult("600002", "B", daily_df(), False, final_source="fresh", latest_date="2026-07-01", expected_trade_date="2026-07-01", is_expected_trade_date=True, success_attempt=2, data_source_name="primary", attempt_logs=[{"source_name":"primary","attempt":2,"final_source":"fresh"}], fetch_started_at="2026-07-02 09:00:01", fetch_finished_at="2026-07-02 09:00:03"),
+        FetchResult("600003", "C", daily_df(), False, final_source="fresh", latest_date="2026-07-01", expected_trade_date="2026-07-01", is_expected_trade_date=True, success_attempt=3, data_source_name="primary", attempt_logs=[{"source_name":"primary","attempt":3,"final_source":"fresh"}], fetch_started_at="2026-07-02 09:00:03", fetch_finished_at="2026-07-02 09:00:06"),
+        FetchResult("600004", "D", daily_df(), False, final_source="fresh", latest_date="2026-07-01", expected_trade_date="2026-07-01", is_expected_trade_date=True, success_attempt=4, data_source_name="fallback", attempt_logs=[{"source_name":"primary","attempt":3,"error_category":"network_error"},{"source_name":"fallback","attempt":1,"final_source":"fresh"}], fetch_started_at="2026-07-02 09:00:06", fetch_finished_at="2026-07-02 09:00:10"),
         FetchResult("600005", "E", daily_df(), True, final_source="cache", latest_date="2026-07-01", expected_trade_date="2026-07-01", is_expected_trade_date=True, error_category="network_error", attempt_logs=[{"error_category": "network_error"}], fetch_started_at="2026-07-02 09:00:10", fetch_finished_at="2026-07-02 09:00:12"),
     ]
     stats = summarize_stock_fetches(results)
     assert stats["attempt_success_distribution"] == {
-        "attempt_1_success": 1,
-        "attempt_2_success": 1,
-        "attempt_3_success": 1,
-        "attempt_4_success": 1,
+        "primary_attempt_1_success": 1,
+        "primary_attempt_2_success": 1,
+        "primary_attempt_3_success": 1,
+        "fallback_attempt_1_success": 1,
         "cache_fallback": 1,
     }
     assert stats["fetch_started_at"] == "2026-07-02 09:00:00"
     assert stats["fetch_finished_at"] == "2026-07-02 09:00:12"
     assert stats["fetch_duration_seconds"] == 12.0
-    assert stats["network_error_count"] == 1
-    assert stats["network_error_ratio"] == 0.2
+    assert stats["network_error_count"] == 2
+    assert stats["network_error_ratio"] == 0.4
     assert "\u91cd\u8dd1" in stats["rerun_suggestion"]
     assert compute_data_quality_level(stock_fetch_stats=stats) == "partial_cache"
+
+
+def test_valid_history_cache_shortens_provider_range_but_provider_still_must_validate_fresh():
+    cache = long_daily_df("2026-06-30", 130)
+    requested = []
+
+    def primary(**kwargs):
+        requested.append(kwargs["start_date"])
+        return daily_df("2026-07-01")
+
+    local_settings = {
+        "data_fetch": {"max_retries": 0, "min_history_days": 120},
+        "cache": {"max_cache_age_trade_days": 1},
+        "data_sources": {"stock_daily": {"primary": "primary", "fallback": ["local_cache"]}},
+    }
+    result = fetch_stock_daily(
+        "600001", "A", settings=local_settings,
+        expected_trade_date_value="2026-07-01",
+        trade_dates=["2026-06-30", "2026-07-01"],
+        cache_reader=lambda _: cache,
+        source_fetchers={"primary": primary},
+    )
+
+    assert requested == ["20260630"]
+    assert result.final_source == "fresh"
+    assert result.provider_success is True
+    assert result.daily_history_cache_hit is True
+    assert len(result.data) >= 120
+
+
+def test_provider_health_demotion_is_session_only(monkeypatch):
+    orders = []
+
+    def fake_fetch(symbol, name, **kwargs):
+        order = list(kwargs.get("source_order") or [])
+        orders.append(order)
+        return FetchResult(
+            symbol, name, daily_df(), False, final_source="fresh",
+            effective_latest_date="2026-07-01", expected_trade_date="2026-07-01",
+            is_expected_trade_date=True, data_source_name="fallback",
+            attempt_logs=[
+                {"source_name": "primary", "attempt": 1, "error_category": "network_error"},
+                {"source_name": "fallback", "attempt": 1, "final_source": "fresh"},
+            ],
+        )
+
+    monkeypatch.setattr(data_fetcher, "fetch_stock_daily", fake_fetch)
+    local_settings = {
+        "data_fetch": {"request_interval_seconds": 0, "max_retries": 2, "provider_circuit_breaker_failure_symbols": 3},
+        "data_sources": {"stock_daily": {"primary": "primary", "fallback": ["fallback", "local_cache"]}},
+    }
+    pool = [{"symbol": f"60000{i}", "name": str(i)} for i in range(4)]
+    first = fetch_stocks(pool, settings=local_settings, expected_trade_date_value="2026-07-01")
+    assert orders[:3] == [["primary", "fallback"]] * 3
+    assert orders[3] == ["fallback", "primary"]
+    assert first[3].provider_health_scope == "session_only"
+
+    orders.clear()
+    fetch_stocks(pool[:1], settings=local_settings, expected_trade_date_value="2026-07-01")
+    assert orders[0] == ["primary", "fallback"]
 
 
 def test_cache_ratio_above_threshold_keeps_critical_and_rerun_suggestion():

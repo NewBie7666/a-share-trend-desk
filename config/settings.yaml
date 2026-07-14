@@ -106,13 +106,34 @@ data_fetch:
   consecutive_failure_soft_pause_seconds: 10
   consecutive_failure_hard_limit: 15
   min_history_days: 120
+  provider_circuit_breaker_failure_symbols: 5
+provider_parallel:
+  enabled: true
+  initial_workers: 4
+  evaluation_window_requests: 20
+  request_jitter_seconds: [0.1, 0.5]
+  adjustment_freeze_windows: 1
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    cooldown_seconds: 120
 runtime:
   enable_runtime_cache: true
   enable_stage_profile: true
 decision_engine:
   version: v3
+decision_version: v3_pr2.1
+timing_version: timing_v1
+indicator_version: indicator_v2
+watchlist_diagnosis:
+  version: watchlist_v1
+  rule_freeze_status: frozen
+  observation_trade_days: 30
 v3:
-  rule_version: v3.0.0
+  rule_version: v3.1.0
+  rule_freeze_status: frozen
+  rule_freeze_trade_days: 30
+  rule_freeze_start_date: "2026-07-14"
   buy_threshold: 75
   watch_threshold: 60
   minimum_stock_factor_for_buy: 60
@@ -126,10 +147,12 @@ v3:
     timing: 0.30
     market: 0.20
   structure_adjustment:
-    breakout: 10
-    pullback: 5
+    breakout: 5
+    pullback: 3
     acceleration: 0
-    distribution: -20
+    distribution: -10
+  market_permission:
+    confirmation_days: 2
 cache:
   max_cache_age_trade_days: 1
 daily_signal:

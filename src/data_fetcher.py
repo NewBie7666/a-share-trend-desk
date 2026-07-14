@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import random
 import time
+from time import perf_counter
 
 import pandas as pd
 
+from .industry_resolver import load_industry_resolver, persist_known_industries
+from .provider_parallel import AdaptiveWorkerState, SessionProviderCircuits
 from .utils import CACHE_DIR, LOG_DIR, ensure_directories, ensure_holdings_file
 
 
@@ -58,16 +63,45 @@ class FetchResult:
     data_source_name: str = ""
     fallback_source_used: str = ""
     source_attempts: list[dict] | None = None
+    provider_success: bool | None = None
+    daily_history_cache_hit: bool = False
+    daily_history_cache_rows: int = 0
+    provider_request_count: int = 0
+    provider_attempts_saved: int = 0
+    provider_seconds_saved: float = 0.0
+    provider_seconds_saved_is_estimate: bool = True
+    provider_health_scope: str = "session_only"
+    provider_task_elapsed_seconds: float = 0.0
+    provider_parallel_enabled: bool = False
+    provider_parallel_initial_workers: int = 1
+    provider_parallel_peak_workers: int = 1
+    provider_parallel_final_workers: int = 1
+    provider_parallel_actual_seconds: float = 0.0
+    provider_worker_history: list[dict] | None = None
+    provider_circuit_history: list[dict] | None = None
 
 
 def is_main_board_symbol(symbol: str) -> bool:
-    symbol = str(symbol).zfill(6)
-    return symbol.startswith(("600", "601", "603", "605", "000", "001", "002"))
+    normalized = _normalize_stock_symbol(symbol)
+    return bool(normalized) and normalized.startswith(("600", "601", "603", "605", "000", "001", "002"))
 
 
 def is_risk_stock_name(name: str) -> bool:
     text = str(name).upper()
     return "ST" in text or "退" in str(name)
+
+
+def _normalize_stock_symbol(value: object) -> str:
+    """Normalize AkShare's 600000/sh600000/600000.SH variants."""
+    text = str(value or "").strip().lower()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    for prefix in ("sh", "sz", "bj"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
+    text = text.split(".", 1)[0]
+    return text.zfill(6) if text.isdigit() and len(text) <= 6 else ""
 
 
 def _normalize_spot_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -81,13 +115,28 @@ def _normalize_spot_columns(df: pd.DataFrame) -> pd.DataFrame:
         "行业": "industry",
     }
     out = df.rename(columns=column_map).copy()
+
+    # AkShare's legacy Sina endpoint may expose mojibake column names under
+    # some Windows/Python combinations. Its field order is stable, so recover
+    # the canonical schema by position only when named mapping is unavailable.
+    legacy_positions = {
+        "symbol": 0,
+        "name": 1,
+        "price": 2,
+        "pct_change": 4,
+        "volume": 11,
+        "amount": 12,
+    }
+    for column, position in legacy_positions.items():
+        if (column not in out.columns or out[column].isna().all()) and len(df.columns) > position:
+            out[column] = df.iloc[:, position].values
     for col in ["symbol", "name", "price", "amount", "industry"]:
         if col not in out.columns:
             out[col] = "未知行业" if col == "industry" else pd.NA
-    out["symbol"] = out["symbol"].astype(str).str.zfill(6)
+    out["symbol"] = out["symbol"].map(_normalize_stock_symbol)
     out["price"] = pd.to_numeric(out["price"], errors="coerce")
     out["amount"] = pd.to_numeric(out["amount"], errors="coerce")
-    return out.dropna(subset=["symbol", "name"])
+    return out[(out["symbol"] != "") & out["name"].notna()].copy()
 
 
 def _normalize_index_constituents(df: pd.DataFrame) -> set[str]:
@@ -121,24 +170,40 @@ def _pool_metadata(pool: list[dict], source: str, version: str) -> dict:
     }
 
 
+def _enrich_pool_industries(pool: list[dict]) -> list[dict]:
+    resolver = load_industry_resolver()
+    output = []
+    for item in pool:
+        row = dict(item)
+        industry, source = resolver.resolve(str(row.get("symbol", "")), row.get("industry"))
+        row["industry"] = industry
+        row["industry_source"] = source
+        output.append(row)
+    persist_known_industries(output)
+    return output
+
+
 def _spot_provider_result(ak, source: str, expected_date: str) -> tuple[pd.DataFrame, dict]:
     started = time.perf_counter()
     try:
         raw = ak.stock_zh_a_spot_em() if source == "akshare_eastmoney_spot" else ak.stock_zh_a_spot()
-        return _normalize_spot_columns(raw), {
+        normalized = _normalize_spot_columns(raw)
+        valid_count = int(normalized["symbol"].ne("").sum()) if not normalized.empty else 0
+        schema_ok = valid_count > 0 and normalized["amount"].notna().any()
+        return normalized, {
             "source": source,
             "status": "success",
             "latency": round(time.perf_counter() - started, 3),
             "symbol_count": len(raw),
             "raw_count": len(raw),
-            "symbol_valid_count": 0,
+            "symbol_valid_count": valid_count,
             "main_board_count": 0,
             "st_filter_count": 0,
             "liquidity_filter_count": 0,
             "final_count": 0,
             "pass_ratio": 0.0,
-            "schema_quality": 1.0,
-            "data_quality": "fresh",
+            "schema_quality": 1.0 if schema_ok else 0.5,
+            "data_quality": "fresh" if schema_ok else "invalid_schema",
             "latest_trade_date": expected_date,
             "data_role": "stock_basic",
         }
@@ -178,10 +243,18 @@ def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str
         for source in ["akshare_eastmoney_spot", "akshare_legacy_spot"]:
             spot, provider = _spot_provider_result(ak, source, expected_date)
             providers.append(provider)
-            if not spot.empty:
+            if (
+                not spot.empty
+                and provider.get("symbol_valid_count", 0) > 0
+                and provider.get("schema_quality", 0) >= 1.0
+            ):
                 break
         if spot.empty:
             raise ConnectionError("; ".join(item.get("error", item["source"]) for item in providers))
+        resolver = load_industry_resolver()
+        resolved = [resolver.resolve(symbol, industry) for symbol, industry in zip(spot["symbol"], spot["industry"])]
+        spot["industry"] = [item[0] for item in resolved]
+        spot["industry_source"] = [item[1] for item in resolved]
         lot_size = int(settings.get("lot_size", 100))
         max_one_lot = float(settings.get("prefilter_max_one_lot_amount", settings.get("initial_cash", 30000)))
         min_amount = float(settings.get("prefilter_min_amount", settings.get("min_avg_amount_20d", 300000000)))
@@ -227,6 +300,7 @@ def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str
                     "symbol": row.symbol,
                     "name": row.name,
                     "industry": str(getattr(row, "industry", "未知行业") or "未知行业"),
+                    "industry_source": str(getattr(row, "industry_source", "unknown") or "unknown"),
                     "price": float(getattr(row, "price", 0) or 0),
                     "amount": float(getattr(row, "amount", 0) or 0),
                     "turnover": float(getattr(row, "turnover", 0) or 0),
@@ -235,6 +309,7 @@ def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str
             )
         if not pool:
             raise ValueError("full market prefilter returned empty pool")
+        persist_known_industries(pool)
         provider["final_count"] = len(pool)
         _write_stock_pool_cache(pool, settings, "实时provider")
         metadata = _pool_metadata(pool, "沪深300+中证500+主板行业龙头+成交额筛选", version)
@@ -261,6 +336,7 @@ def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str
     except Exception as exc:  # pragma: no cover - network fallback depends on environment
         cached, cache_meta = _read_stock_pool_cache(settings)
         if cached:
+            cached = _enrich_pool_industries(cached)
             metadata = _pool_metadata(cached, "本地缓存股票池", version)
             metadata.update({
                 "providers": [{"source": "local_cache", "status": "fallback", "latency": 0.0, "symbol_count": len(cached), "latest_trade_date": cache_meta.get("trade_date", ""), "data_role": "stock_basic", "error": str(exc)}],
@@ -269,6 +345,7 @@ def load_main_board_stock_pool(settings: dict, fallback_pool: list[dict[str, str
                 "cache_metadata": cache_meta,
             })
             return cached, True, str(exc), metadata
+        fallback_pool = _enrich_pool_industries(fallback_pool)
         metadata = _pool_metadata(fallback_pool, "本地备用白名单", version)
         metadata.update({
             "providers": [{"source": "local_whitelist", "status": "fallback", "latency": 0.0, "symbol_count": len(fallback_pool), "latest_trade_date": "", "data_role": "stock_basic", "error": str(exc)}],
@@ -386,6 +463,7 @@ def _source_attempt(
     effective_latest_date: str | None = None,
     trimmed_future_rows_count: int = 0,
     rows: int = 0,
+    latency_seconds: float = 0.0,
 ) -> dict:
     return {
         "source_name": source_name,
@@ -397,6 +475,7 @@ def _source_attempt(
         "effective_latest_date": effective_latest_date or "",
         "trimmed_future_rows_count": trimmed_future_rows_count,
         "rows": rows,
+        "latency_seconds": round(float(latency_seconds or 0), 4),
     }
 
 
@@ -421,7 +500,10 @@ def read_cache(symbol: str) -> pd.DataFrame:
 
 def _write_cache(symbol: str, df: pd.DataFrame) -> None:
     ensure_directories()
-    df.to_csv(_cache_path(symbol), index=False, encoding="utf-8-sig")
+    path = _cache_path(symbol)
+    temp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{random.randrange(1_000_000)}.tmp")
+    df.to_csv(temp, index=False, encoding="utf-8-sig")
+    os.replace(temp, path)
 
 
 def latest_date_of(df: pd.DataFrame) -> str | None:
@@ -583,6 +665,7 @@ def _make_result(
     fallback_source_used: str = "",
     source_attempts: list[dict] | None = None,
     min_history_days: int = 0,
+    provider_success: bool = False,
 ) -> FetchResult:
     trimmed_df, raw_latest_date, effective_latest_date, trimmed_count = _trim_to_expected_trade_date(df, expected_trade_date_value)
     is_expected = True if expected_trade_date_value is None else effective_latest_date == expected_trade_date_value
@@ -622,6 +705,7 @@ def _make_result(
         data_source_name=data_source_name,
         fallback_source_used=fallback_source_used,
         source_attempts=source_attempts or [],
+        provider_success=provider_success,
     )
 
 
@@ -642,6 +726,7 @@ def _empty_result(
     data_source_name: str = "",
     fallback_source_used: str = "",
     source_attempts: list[dict] | None = None,
+    provider_success: bool = False,
 ) -> FetchResult:
     return FetchResult(
         symbol=symbol,
@@ -664,6 +749,7 @@ def _empty_result(
         data_source_name=data_source_name,
         fallback_source_used=fallback_source_used,
         source_attempts=source_attempts or [],
+        provider_success=provider_success,
     )
 
 
@@ -763,6 +849,7 @@ def fetch_stock_daily(
     fetcher=None,
     cache_reader=read_cache,
     source_fetchers: dict[str, object] | None = None,
+    source_order: list[str] | None = None,
 ) -> FetchResult:
     ensure_directories()
     settings = settings or {}
@@ -782,6 +869,20 @@ def fetch_stock_daily(
     last_error = ""
     fetch_started_at = _now_text()
     attempt_count = 0
+    cached_history = pd.DataFrame()
+    try:
+        cached_raw = cache_reader(symbol)
+        if not cached_raw.empty:
+            normalized_cache = _normalize_daily_columns(cached_raw)
+            trimmed_cache, _, cache_latest, _ = _trim_to_expected_trade_date(
+                normalized_cache, expected_trade_date_value
+            )
+            required = {"date", "open", "high", "low", "close", "volume", "amount"}
+            if len(trimmed_cache) >= min_history_days and required.issubset(trimmed_cache.columns) and cache_latest:
+                cached_history = trimmed_cache.tail(days).copy()
+                start_date = str(cache_latest).replace("-", "")
+    except Exception:
+        cached_history = pd.DataFrame()
     if settings.get("akshare_runtime_unavailable") and fetcher is None and not source_fetchers:
         return _read_valid_cache(
             symbol,
@@ -803,20 +904,26 @@ def fetch_stock_daily(
     else:
         primary = source_cfg.get("primary", "akshare_eastmoney")
         fallbacks = list(source_cfg.get("fallback", ["akshare_sina", "local_cache"]) or [])
-        source_names = [primary] + [item for item in fallbacks if item != primary and item != "local_cache"]
+        default_sources = [primary] + [item for item in fallbacks if item != primary and item != "local_cache"]
+        if source_order is None:
+            source_names = default_sources
+        else:
+            source_names = [item for item in source_order if item in default_sources]
 
     for source_name in source_names:
         source_fetcher = (source_fetchers or {}).get(source_name)
         for attempt in range(1, max_retries + 2):
             attempt_count += 1
+            request_started = perf_counter()
             try:
                 raw = source_fetcher(symbol=symbol, start_date=start_date, end_date=end_date) if source_fetcher else _fetch_stock_source(source_name, symbol, start_date, end_date, fetcher=fetcher, network_timeout=network_timeout)
-                df = _normalize_daily_columns(raw).tail(days)
-                _validate_daily(df)
-                result = _make_result(
+                request_latency = perf_counter() - request_started
+                provider_df = _normalize_daily_columns(raw).tail(days)
+                _validate_daily(provider_df)
+                provider_result = _make_result(
                     symbol,
                     name,
-                    df,
+                    provider_df,
                     final_source="fresh",
                     expected_trade_date_value=expected_trade_date_value,
                     attempt_logs=attempt_logs,
@@ -827,37 +934,61 @@ def fetch_stock_daily(
                     data_source_name=source_name,
                     fallback_source_used="" if source_name == source_names[0] else source_name,
                     source_attempts=source_attempts,
-                    min_history_days=min_history_days,
+                    min_history_days=0,
+                    provider_success=True,
                 )
                 source_attempts.append(
                     _source_attempt(
                         source_name=source_name,
-                        status="success" if result.final_source == "fresh" else "failed",
-                        final_source=result.final_source,
-                        error=result.error or result.data_staleness_reason or "",
-                        error_category=result.error_category,
-                        raw_latest_date=result.raw_latest_date,
-                        effective_latest_date=result.effective_latest_date,
-                        trimmed_future_rows_count=result.trimmed_future_rows_count,
-                        rows=len(result.data),
+                        status="success" if provider_result.final_source == "fresh" else "failed",
+                        final_source=provider_result.final_source,
+                        error=provider_result.error or provider_result.data_staleness_reason or "",
+                        error_category=provider_result.error_category,
+                        raw_latest_date=provider_result.raw_latest_date,
+                        effective_latest_date=provider_result.effective_latest_date,
+                        trimmed_future_rows_count=provider_result.trimmed_future_rows_count,
+                        rows=len(provider_result.data),
+                        latency_seconds=request_latency,
                     )
                 )
-                attempt_logs.append({"attempt": attempt, "source_name": source_name, "error": result.error or result.data_staleness_reason or "", "error_category": result.error_category, "final_source": result.final_source, "attempt_count": attempt_count, "success_attempt": attempt_count if result.final_source == "fresh" else ""})
-                if result.final_source == "fresh":
+                attempt_logs.append({"attempt": attempt, "source_name": source_name, "status": "success" if provider_result.final_source == "fresh" else "failed", "error": provider_result.error or provider_result.data_staleness_reason or "", "error_category": provider_result.error_category, "final_source": provider_result.final_source, "attempt_count": attempt_count, "success_attempt": attempt_count if provider_result.final_source == "fresh" else "", "latency_seconds": round(request_latency, 4)})
+                if provider_result.final_source == "fresh":
+                    if not cached_history.empty:
+                        combined = pd.concat([cached_history, provider_df], ignore_index=True)
+                        combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
+                        combined = combined.dropna(subset=["date"]).sort_values("date").drop_duplicates("date", keep="last")
+                        combined["date"] = combined["date"].dt.strftime("%Y-%m-%d")
+                        combined = combined.tail(days).reset_index(drop=True)
+                    else:
+                        combined = provider_df
+                    result = _make_result(
+                        symbol, name, combined, final_source="fresh",
+                        expected_trade_date_value=expected_trade_date_value,
+                        attempt_logs=attempt_logs, success_attempt=attempt_count,
+                        attempt_count=attempt_count, fetch_started_at=fetch_started_at,
+                        fetch_finished_at=_now_text(), data_source_name=source_name,
+                        fallback_source_used="" if source_name == source_names[0] else source_name,
+                        source_attempts=source_attempts, min_history_days=min_history_days,
+                        provider_success=True,
+                    )
+                    result.daily_history_cache_hit = not cached_history.empty
+                    result.daily_history_cache_rows = len(cached_history)
+                    result.provider_request_count = attempt_count
                     _write_cache(symbol, result.data)
                     return result
-                last_error = result.error_category or result.data_staleness_reason or result.error or ""
+                last_error = provider_result.error_category or provider_result.data_staleness_reason or provider_result.error or ""
                 break
             except Exception as exc:  # pragma: no cover - network fallback depends on environment
+                request_latency = perf_counter() - request_started
                 last_error = str(exc)
                 error_category = categorize_error(exc)
-                source_attempts.append(_source_attempt(source_name=source_name, status="failed", error=last_error, error_category=error_category))
-                attempt_logs.append({"attempt": attempt, "source_name": source_name, "error": last_error, "error_category": error_category, "final_source": "", "attempt_count": attempt_count, "last_error": last_error})
+                source_attempts.append(_source_attempt(source_name=source_name, status="failed", error=last_error, error_category=error_category, latency_seconds=request_latency))
+                attempt_logs.append({"attempt": attempt, "source_name": source_name, "status": "failed", "error": last_error, "error_category": error_category, "final_source": "", "attempt_count": attempt_count, "last_error": last_error, "latency_seconds": round(request_latency, 4)})
                 if attempt <= max_retries:
                     wait = float(retry_backoff[min(attempt - 1, len(retry_backoff) - 1)])
                     _sleep_with_jitter(wait, jitter_seconds, sleep_fn)
 
-    return _read_valid_cache(
+    result = _read_valid_cache(
         symbol,
         name,
         expected_trade_date_value=expected_trade_date_value,
@@ -872,6 +1003,10 @@ def fetch_stock_daily(
         min_history_days=min_history_days,
         source_attempts=source_attempts,
     )
+    result.daily_history_cache_hit = not cached_history.empty
+    result.daily_history_cache_rows = len(cached_history)
+    result.provider_request_count = attempt_count
+    return result
 
 
 def fetch_hs300_daily(days: int = 300) -> FetchResult:
@@ -924,6 +1059,7 @@ def fetch_index_daily(
                 fallback_source_used="" if source_name == source_names[0] else source_name,
                 source_attempts=source_attempts,
                 min_history_days=min_history_days,
+                provider_success=True,
             )
             source_attempts.append(
                 _source_attempt(
@@ -985,6 +1121,125 @@ def fetch_market_indices(expected_trade_date_value: str | None = None, settings:
     return results
 
 
+def _fetch_stocks_parallel(
+    stock_pool: list[dict[str, str]],
+    *,
+    settings: dict,
+    expected_trade_date_value: str | None,
+    trade_dates: list[str] | None,
+    progress: bool,
+    sleep_fn,
+) -> list[FetchResult]:
+    parallel_cfg = settings.get("provider_parallel", {}) or {}
+    circuit_cfg = parallel_cfg.get("circuit_breaker", {}) or {}
+    fetch_cfg = settings.get("data_fetch", {}) or {}
+    source_cfg = ((settings.get("data_sources", {}) or {}).get("stock_daily", {}) or {})
+    primary = str(source_cfg.get("primary", "akshare_eastmoney"))
+    fallbacks = [
+        str(item) for item in (source_cfg.get("fallback", ["akshare_sina", "local_cache"]) or [])
+        if item not in {primary, "local_cache"}
+    ]
+    default_order = [primary, *fallbacks]
+    initial_workers = int(parallel_cfg.get("initial_workers", 4) or 4)
+    if initial_workers not in {1, 2, 4, 6, 8}:
+        initial_workers = 4
+    worker_state = AdaptiveWorkerState(workers=initial_workers)
+    circuits = SessionProviderCircuits(
+        default_order,
+        failure_threshold=(int(circuit_cfg.get("failure_threshold", 5) or 5) if bool(circuit_cfg.get("enabled", True)) else 1_000_000_000),
+        cooldown_seconds=float(circuit_cfg.get("cooldown_seconds", 120) or 120),
+    )
+    window_size = max(int(parallel_cfg.get("evaluation_window_requests", 20) or 20), 1)
+    jitter_range = list(parallel_cfg.get("request_jitter_seconds", [0.1, 0.5]) or [0.1, 0.5])
+    jitter_low = float(jitter_range[0] if jitter_range else 0.1)
+    jitter_high = float(jitter_range[-1] if jitter_range else 0.5)
+    freeze_after = int(parallel_cfg.get("adjustment_freeze_windows", 1) or 0)
+    network_timeout = float(fetch_cfg.get("network_timeout_seconds", 10) or 10)
+    _install_requests_default_timeout(network_timeout)
+
+    results: list[FetchResult] = []
+    task_elapsed: list[float] = []
+    peak_workers = initial_workers
+    consecutive_network_failures = 0
+    hard_limit = int(fetch_cfg.get("consecutive_failure_hard_limit", 0) or 0)
+    aborted = False
+    parallel_started = perf_counter()
+
+    def run_one(item: dict, source_order: list[str]) -> tuple[FetchResult, float]:
+        if jitter_high > 0:
+            sleep_fn(random.uniform(max(jitter_low, 0), max(jitter_high, jitter_low)))
+        started = perf_counter()
+        result = fetch_stock_daily(
+            item["symbol"], item["name"], settings=settings,
+            expected_trade_date_value=expected_trade_date_value,
+            trade_dates=trade_dates, sleep_fn=sleep_fn, source_order=source_order,
+        )
+        elapsed = perf_counter() - started
+        result.provider_task_elapsed_seconds = round(elapsed, 4)
+        result.provider_parallel_enabled = True
+        return result, elapsed
+
+    for offset in range(0, len(stock_pool), window_size):
+        wave = stock_pool[offset:offset + window_size]
+        if aborted:
+            break
+        if progress:
+            print(f"并发获取日线进度：{offset + 1}/{len(stock_pool)}，workers={worker_state.workers}", flush=True)
+        submitted: list[tuple[int, object]] = []
+        wave_results: dict[int, tuple[FetchResult, float]] = {}
+        with ThreadPoolExecutor(max_workers=worker_state.workers, thread_name_prefix="daily-provider") as executor:
+            for local_index, item in enumerate(wave):
+                order = circuits.source_order_for_task(default_order)
+                future = executor.submit(run_one, item, order)
+                submitted.append((local_index, future))
+            for local_index, future in submitted:
+                wave_results[local_index] = future.result()
+
+        wave_attempts: list[dict] = []
+        for local_index in range(len(wave)):
+            result, elapsed = wave_results[local_index]
+            results.append(result)
+            task_elapsed.append(elapsed)
+            provider_attempts = [
+                attempt for attempt in (result.source_attempts or [])
+                if attempt.get("source_name") != "local_cache"
+            ]
+            wave_attempts.extend(provider_attempts)
+            circuits.record_symbol_result(provider_attempts)
+            result_network_failed = result.final_source != "fresh" and (
+                result.error_category == "network_error"
+                or any(item.get("error_category") == "network_error" for item in (result.attempt_logs or []))
+            )
+            consecutive_network_failures = consecutive_network_failures + 1 if result_network_failed else 0
+            if hard_limit and consecutive_network_failures >= hard_limit:
+                aborted = True
+        worker_state.evaluate(wave_attempts, freeze_after_change=freeze_after)
+        peak_workers = max(peak_workers, worker_state.workers)
+
+    if aborted and len(results) < len(stock_pool):
+        for item in stock_pool[len(results):]:
+            results.append(_empty_result(
+                item["symbol"], item["name"], error="too_many_consecutive_failures",
+                expected_trade_date_value=expected_trade_date_value,
+                error_category="data_fetch_aborted",
+                fallback_reason="too_many_consecutive_failures",
+                data_fetch_abort_reason="too_many_consecutive_failures",
+                fetch_started_at=_now_text(), fetch_finished_at=_now_text(),
+            ))
+
+    actual_seconds = perf_counter() - parallel_started
+    for result in results:
+        result.provider_parallel_enabled = True
+        result.provider_parallel_initial_workers = initial_workers
+        result.provider_parallel_peak_workers = peak_workers
+        result.provider_parallel_final_workers = worker_state.workers
+        result.provider_parallel_actual_seconds = round(actual_seconds, 4)
+        result.provider_worker_history = list(worker_state.history)
+        result.provider_circuit_history = list(circuits.history)
+        result.provider_health_scope = "session_only"
+    return results
+
+
 def fetch_stocks(
     stock_pool: list[dict[str, str]],
     progress: bool = False,
@@ -1005,12 +1260,65 @@ def fetch_stocks(
     soft_limit = int(fetch_cfg.get("consecutive_failure_soft_limit", 0) or 0)
     soft_pause = float(fetch_cfg.get("consecutive_failure_soft_pause_seconds", 0) or 0)
     hard_limit = int(fetch_cfg.get("consecutive_failure_hard_limit", 0) or 0)
+    using_default_fetcher = stock_fetcher is None
     stock_fetcher = stock_fetcher or fetch_stock_daily
+    parallel_cfg = ((settings or {}).get("provider_parallel", {}) or {})
+    if using_default_fetcher and bool(parallel_cfg.get("enabled", False)):
+        return _fetch_stocks_parallel(
+            stock_pool,
+            settings=settings or {},
+            expected_trade_date_value=expected_trade_date_value,
+            trade_dates=trade_dates,
+            progress=progress,
+            sleep_fn=sleep_fn,
+        )
     consecutive_network_failures = 0
+    source_cfg = (((settings or {}).get("data_sources", {}) or {}).get("stock_daily", {}) or {})
+    primary_source = str(source_cfg.get("primary", "akshare_eastmoney"))
+    fallback_sources = [
+        str(item) for item in (source_cfg.get("fallback", ["akshare_sina", "local_cache"]) or [])
+        if item != "local_cache" and item != primary_source
+    ]
+    default_source_order = [primary_source, *fallback_sources]
+    active_source_order = list(default_source_order)
+    primary_failure_symbols = 0
+    circuit_threshold = int(fetch_cfg.get("provider_circuit_breaker_failure_symbols", 3) or 3)
+    max_retries = int(fetch_cfg.get("max_retries", 2) or 2)
+    retry_backoff = list(fetch_cfg.get("retry_backoff_seconds", [1, 3]) or [1, 3])
     for idx, item in enumerate(stock_pool, start=1):
         if progress and (idx == 1 or idx % 10 == 0 or idx == total):
             print(f"获取日线进度：{idx}/{total} {item['symbol']} {item['name']}", flush=True)
-        result = stock_fetcher(item["symbol"], item["name"], settings=settings, expected_trade_date_value=expected_trade_date_value, trade_dates=trade_dates)
+        fetch_kwargs = {
+            "settings": settings,
+            "expected_trade_date_value": expected_trade_date_value,
+            "trade_dates": trade_dates,
+        }
+        if using_default_fetcher:
+            fetch_kwargs["source_order"] = active_source_order
+        result = stock_fetcher(item["symbol"], item["name"], **fetch_kwargs)
+        primary_logs = [
+            log for log in (result.attempt_logs or [])
+            if log.get("source_name") == primary_source
+        ]
+        primary_exhausted_by_network = (
+            bool(primary_logs)
+            and result.data_source_name != primary_source
+            and all(log.get("error_category") == "network_error" for log in primary_logs)
+        )
+        if result.final_source == "fresh" and result.data_source_name == primary_source:
+            primary_failure_symbols = 0
+        elif primary_exhausted_by_network:
+            primary_failure_symbols += 1
+        if (
+            using_default_fetcher
+            and fallback_sources
+            and primary_failure_symbols >= circuit_threshold
+            and active_source_order[0] == primary_source
+        ):
+            active_source_order = [*fallback_sources, primary_source]
+        if active_source_order and active_source_order[0] != primary_source and result.data_source_name in fallback_sources:
+            result.provider_attempts_saved = max_retries + 1
+            result.provider_seconds_saved = round(sum(float(value) for value in retry_backoff[:max_retries]), 2)
         stocks.append(result)
         result_network_failed = result.final_source != "fresh" and (
             result.error_category == "network_error"
@@ -1069,13 +1377,18 @@ def summarize_stock_fetches(results: list[FetchResult]) -> dict:
     unexpected = [r for r in results if not r.data.empty and not r.is_expected_trade_date]
     stale_cache = [r for r in results if r.error_category == "stale_cache"]
     future_trimmed = [r for r in results if int(r.trimmed_future_rows_count or 0) > 0]
-    attempt_distribution = {
-        "attempt_1_success": sum(1 for r in fresh if r.success_attempt == 1),
-        "attempt_2_success": sum(1 for r in fresh if r.success_attempt == 2),
-        "attempt_3_success": sum(1 for r in fresh if r.success_attempt == 3),
-        "attempt_4_success": sum(1 for r in fresh if r.success_attempt == 4),
-        "cache_fallback": len(cache),
-    }
+    attempt_distribution: dict[str, int] = {}
+    for result in fresh:
+        success_log = next(
+            (log for log in (result.attempt_logs or []) if log.get("final_source") == "fresh"),
+            None,
+        )
+        if success_log:
+            key = f"{success_log.get('source_name', 'unknown')}_attempt_{success_log.get('attempt', 0)}_success"
+        else:
+            key = f"{result.data_source_name or 'unknown'}_success"
+        attempt_distribution[key] = attempt_distribution.get(key, 0) + 1
+    attempt_distribution["cache_fallback"] = len(cache)
     network_error_count = sum(
         1
         for r in results
@@ -1083,6 +1396,28 @@ def summarize_stock_fetches(results: list[FetchResult]) -> dict:
     )
     network_error_ratio = network_error_count / total if total else 0.0
     cache_fallback_ratio = len(cache) / total if total else 0.0
+    provider_latencies = [
+        float(attempt.get("latency_seconds", 0) or 0)
+        for result in results
+        for attempt in (result.source_attempts or [])
+        if attempt.get("source_name") != "local_cache" and float(attempt.get("latency_seconds", 0) or 0) >= 0
+    ]
+    provider_latencies.sort()
+
+    def latency_percentile(percentile: float) -> float:
+        if not provider_latencies:
+            return 0.0
+        position = (len(provider_latencies) - 1) * percentile
+        lower = int(position)
+        upper = min(lower + 1, len(provider_latencies) - 1)
+        fraction = position - lower
+        return provider_latencies[lower] + (provider_latencies[upper] - provider_latencies[lower]) * fraction
+
+    parallel_sample = next((item for item in results if item.provider_parallel_enabled), None)
+    serial_estimated = sum(float(item.provider_task_elapsed_seconds or 0) for item in results)
+    actual_parallel = float(parallel_sample.provider_parallel_actual_seconds or 0) if parallel_sample else 0.0
+    parallel_saved = max(serial_estimated - actual_parallel, 0.0)
+    source_saved = sum(float(item.provider_seconds_saved or 0) for item in results)
     data_fetch_abort_reason = next((r.data_fetch_abort_reason for r in results if r.data_fetch_abort_reason), "")
     if data_fetch_abort_reason:
         rerun_suggestion = "\u672c\u6b21\u6293\u53d6\u56e0\u8fde\u7eed\u7f51\u7edc\u5931\u8d25\u4e2d\u6b62\uff0c\u5efa\u8bae\u7a0d\u540e\u91cd\u8dd1\uff1b\u82e5\u591a\u6b21\u51fa\u73b0\uff0c\u8bf7\u5207\u6362\u5907\u7528\u6570\u636e\u6e90\u3002"
@@ -1119,6 +1454,31 @@ def summarize_stock_fetches(results: list[FetchResult]) -> dict:
         "fetch_finished_at": fetch_finished_at,
         "fetch_duration_seconds": round(duration, 2),
         "attempt_success_distribution": attempt_distribution,
+        "daily_history_cache_hit": sum(1 for r in results if r.daily_history_cache_hit),
+        "daily_history_cache_miss": sum(1 for r in results if not r.daily_history_cache_hit),
+        "daily_cache_final_fallback_count": len(cache),
+        "provider_request_count": sum(int(r.provider_request_count or 0) for r in results),
+        "provider_source_success_distribution": {
+            source: sum(1 for r in fresh if r.data_source_name == source)
+            for source in sorted({r.data_source_name for r in fresh if r.data_source_name})
+        },
+        "provider_attempts_saved": sum(int(r.provider_attempts_saved or 0) for r in results),
+        "provider_seconds_saved": round(source_saved + parallel_saved, 2),
+        "provider_seconds_saved_is_estimate": True,
+        "provider_health_scope": "session_only",
+        "provider_parallel_enabled": bool(parallel_sample),
+        "provider_parallel_initial_workers": parallel_sample.provider_parallel_initial_workers if parallel_sample else 1,
+        "provider_parallel_peak_workers": parallel_sample.provider_parallel_peak_workers if parallel_sample else 1,
+        "provider_parallel_final_workers": parallel_sample.provider_parallel_final_workers if parallel_sample else 1,
+        "provider_worker_history": list(parallel_sample.provider_worker_history or []) if parallel_sample else [],
+        "provider_circuit_history": list(parallel_sample.provider_circuit_history or []) if parallel_sample else [],
+        "latency_p50": round(latency_percentile(0.50), 4),
+        "latency_p90": round(latency_percentile(0.90), 4),
+        "latency_max": round(max(provider_latencies), 4) if provider_latencies else 0.0,
+        "serial_estimated_seconds": round(serial_estimated, 3),
+        "actual_parallel_seconds": round(actual_parallel, 3),
+        "provider_parallel_efficiency": round(serial_estimated / actual_parallel, 2) if actual_parallel > 0 else 1.0,
+        "fresh_rate": round(len(fresh) / total, 4) if total else 0.0,
         "network_error_count": network_error_count,
         "network_error_ratio": round(network_error_ratio, 4),
         "data_fetch_abort_reason": data_fetch_abort_reason,

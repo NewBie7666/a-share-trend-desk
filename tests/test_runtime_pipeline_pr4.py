@@ -28,7 +28,18 @@ def test_analysis_selector_uses_basic_pool_fields_and_preserves_reasons():
     selected, reasons = select_analysis_pool(pool, 5)
     assert len(selected) == 5
     assert set(reasons) == {str(item["symbol"]).zfill(6) for item in pool}
-    assert all(reasons[symbol] for symbol in selected)
+    assert all(reasons[symbol]["analysis_pool_reason_codes"] for symbol in selected)
+    assert all(reasons[symbol]["selected_for_analysis"] for symbol in selected)
+
+
+def test_unknown_industry_disables_bonus_without_penalty():
+    pool = [
+        {"symbol": f"600{i:03d}", "name": str(i), "industry": "未知行业", "amount": 1000 - i, "price": 10, "turnover": 2}
+        for i in range(6)
+    ]
+    selected, audits = select_analysis_pool(pool, 3)
+    assert len(selected) == 3
+    assert all(item["industry_coverage_bonus"] == 0 for item in audits.values())
 
 
 def test_four_level_pipeline_limits_are_monotonic():

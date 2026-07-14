@@ -66,6 +66,39 @@ def select_timing_pool(snapshots_by_symbol: dict, limit: int = 30) -> list[str]:
     return [symbol for symbol, _ in scored[:limit]]
 
 
+def timing_pool_audit(snapshots_by_symbol: dict, selected_symbols: list[str]) -> dict[str, dict]:
+    """Explain timing-pool selection using only fields available before Timing runs."""
+    selected = set(selected_symbols)
+    scored = []
+    for symbol, snapshot in snapshots_by_symbol.items():
+        score = getattr(snapshot, "score", None) or {}
+        value = float(score.get("final_score", score.get("score", 0)) or 0)
+        scored.append((symbol, value, snapshot))
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    output: dict[str, dict] = {}
+    for rank, (symbol, value, snapshot) in enumerate(scored, start=1):
+        codes = ["FACTOR_SCORE_TOP"] if symbol in selected else ["RANK_BELOW_TIMING_LIMIT"]
+        score_data = getattr(snapshot, "score", None) or {}
+        if str(score_data.get("style_state", "")) == "strong":
+            codes.append("STRONG_STYLE_CANDIDATE")
+        if _latest_amount(snapshot) > 0:
+            codes.append("LIQUIDITY_SUPPORT")
+        reason_map = {
+            "FACTOR_SCORE_TOP": "个股因子分排名进入Timing池",
+            "STRONG_STYLE_CANDIDATE": "强风格候选",
+            "LIQUIDITY_SUPPORT": "成交活跃度支持",
+            "RANK_BELOW_TIMING_LIMIT": "因子分排名低于Timing池上限",
+        }
+        output[symbol] = {
+            "selected_for_timing": symbol in selected,
+            "timing_selection_rank": rank if symbol in selected else None,
+            "timing_selection_score": round(value, 2),
+            "timing_selection_reason_codes": codes,
+            "timing_selection_reason": "；".join(reason_map[code] for code in codes),
+        }
+    return output
+
+
 def select_candidate_pool(snapshots_by_symbol: dict, limit: int = 10) -> list[str]:
     return select_timing_pool(snapshots_by_symbol, limit)
 
