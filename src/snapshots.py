@@ -10,6 +10,7 @@ from .filters import evaluate_hard_filters
 from .indicators import add_indicators
 from .scoring import score_stock
 from .timing import evaluate_timing
+from .runtime_cache import RuntimeCache
 
 
 @dataclass
@@ -76,6 +77,8 @@ def build_stock_snapshots(
     indicator_fn: Callable[[pd.DataFrame, pd.DataFrame | None], pd.DataFrame] = add_indicators,
     filter_fn: Callable[[str, str, pd.DataFrame, dict, dict], list[str]] = evaluate_hard_filters,
     scorer_fn: Callable[[str, str, pd.DataFrame], dict] = score_stock,
+    runtime_cache: RuntimeCache | None = None,
+    compute_timing: bool = True,
 ) -> tuple[dict[str, StockSnapshot], dict]:
     snapshots: dict[str, StockSnapshot] = {}
     indicator_compute_count = 0
@@ -102,11 +105,16 @@ def build_stock_snapshots(
             data_issue_count += 1
             continue
 
-        indicators = indicator_fn(price_data, hs300_indicators)
-        indicator_compute_count += 1
+        trade_date = result.effective_latest_date or result.latest_date or ""
+        indicators = runtime_cache.get_indicator(trade_date, symbol) if runtime_cache else None
+        if indicators is None:
+            indicators = indicator_fn(price_data, hs300_indicators)
+            indicator_compute_count += 1
+            if runtime_cache:
+                runtime_cache.set_indicator(trade_date, symbol, indicators)
         filter_reasons = filter_fn(symbol, name, indicators, settings, filter_rules)
         score = scorer_fn(symbol, name, indicators) if not indicators.empty else None
-        timing = evaluate_timing(indicators) if not indicators.empty else {}
+        timing = evaluate_timing(indicators) if compute_timing and not indicators.empty else {}
         style = (score or {}).get("best_style", "other")
         style_state = (score or {}).get("style_state", "")
         snapshots[symbol] = StockSnapshot(
@@ -134,6 +142,26 @@ def build_stock_snapshots(
         "no_duplicate_io": True,
     }
     return snapshots, stats
+
+
+def compute_snapshot_timing(
+    snapshots_by_symbol: dict[str, StockSnapshot],
+    runtime_cache: RuntimeCache | None = None,
+) -> int:
+    """Evaluate timing exactly once for selected snapshots, without any IO."""
+    computed = 0
+    for symbol, snapshot in snapshots_by_symbol.items():
+        if not snapshot.usable_for_signal or snapshot.indicators.empty:
+            continue
+        latest_date = snapshot.fetch_result.effective_latest_date or snapshot.fetch_result.latest_date or ""
+        timing = runtime_cache.get_timing(symbol, latest_date) if runtime_cache else None
+        if timing is None:
+            timing = evaluate_timing(snapshot.indicators)
+            computed += 1
+            if runtime_cache:
+                runtime_cache.set_timing(symbol, latest_date, timing)
+        snapshot.timing = timing
+    return computed
 
 
 def snapshots_to_frames(snapshots: dict[str, StockSnapshot], *, usable_only: bool = True) -> dict[str, pd.DataFrame]:

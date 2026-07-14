@@ -123,11 +123,9 @@ def load_config() -> dict[str, Any]:
 
 
 def _apply_runtime_profile(settings: dict[str, Any]) -> None:
-    profile_name = settings.get("runtime_profile", "fast")
-    profiles = settings.get("profiles", {}) or {}
+    profile_name = settings.get("fetch_profile", settings.get("runtime_profile", "fast"))
+    profiles = settings.get("fetch_profiles", settings.get("profiles", {})) or {}
     profile = profiles.get(profile_name, {}) or {}
-    if "max_scan_symbols" in profile:
-        settings["max_scan_symbols"] = profile["max_scan_symbols"]
     profile_fetch = profile.get("data_fetch", {}) or {}
     if profile_fetch:
         fetch_cfg = dict(settings.get("data_fetch", {}) or {})

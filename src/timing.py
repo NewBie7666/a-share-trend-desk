@@ -6,6 +6,77 @@ import pandas as pd
 STRUCTURES = {"breakout", "acceleration", "pullback", "distribution", "breakdown"}
 BUY_ALLOWED_STRUCTURES = {"breakout", "acceleration", "pullback"}
 
+TIMING_REASON_TEXT = {
+    "PRICE_BELOW_MA60": "收盘价跌破MA60",
+    "PRICE_BELOW_MA20": "收盘价跌破MA20",
+    "TREND_SLOPE_AND_RS_WEAK": "MA20斜率与相对强弱同时转弱",
+    "LONG_UPPER_SHADOW": "出现放量长上影",
+    "VOLUME_EXPANSION_BELOW_MA5": "放量且收盘跌破MA5",
+    "NEAR_HIGH_MOMENTUM_WEAK": "接近阶段高位但动能转弱",
+    "SHORT_TERM_MOMENTUM_WEAK": "短线价格与动能转弱",
+    "MA_BULLISH_ACCELERATION": "均线多头且短线加速",
+    "PRICE_NEAR_HIGH": "价格接近阶段高点",
+    "PULLBACK_NEAR_MA20": "趋势未破并回踩MA20附近",
+    "TREND_ABOVE_KEY_MA": "价格保持在关键均线上方",
+    "DECISION_BREAKDOWN": "破位阶段禁止买入",
+    "DECISION_DISTRIBUTION_PROTECTED": "强趋势分歧，等待确认",
+    "DECISION_DISTRIBUTION_AVOID": "分歧且趋势保护不成立",
+    "ENTRY_SCORE_BELOW_60": "买点质量低于60",
+    "ENTRY_SCORE_WAIT_RANGE": "买点质量处于等待区间",
+    "CONFIDENCE_BUY": "结构与置信度达到BUY要求",
+    "CONFIDENCE_WAIT": "决策置信度处于WAIT区间",
+    "CONFIDENCE_LOW": "决策置信度不足",
+    "TIMING_REASON_UNAVAILABLE": "时机原因不可用",
+}
+
+
+def timing_reason_codes(df: pd.DataFrame, structure_state: str, timing_decision: str) -> list[str]:
+    """Explain existing Timing outcomes without participating in the decision."""
+    if df is None or df.empty:
+        return ["TIMING_REASON_UNAVAILABLE"]
+    row = _latest(df)
+    close = _safe_float(row, "close")
+    ma5 = _safe_float(row, "ma5")
+    ma20 = _safe_float(row, "ma20")
+    ma60 = _safe_float(row, "ma60")
+    ma20_slope = _safe_float(row, "ma20_slope")
+    rs20 = _safe_float(row, "relative_strength_20d")
+    amount = _safe_float(row, "amount")
+    avg_amount = _safe_float(row, "avg_amount_20d")
+    volume_ratio = amount / avg_amount if avg_amount > 0 else 1.0
+    k = _safe_float(row, "kdj_k", 50)
+    d = _safe_float(row, "kdj_d", 50)
+    macd_dif = _safe_float(row, "macd_dif")
+    macd_dea = _safe_float(row, "macd_dea")
+    recent_high = float(df["high"].tail(60).max()) if "high" in df.columns else close
+    near_recent_high = close >= recent_high * 0.97 if recent_high > 0 else False
+    codes: list[str] = []
+    if structure_state == "breakdown":
+        if close < ma60:
+            codes.append("PRICE_BELOW_MA60")
+        if close < ma20:
+            codes.append("PRICE_BELOW_MA20")
+        if ma20_slope < 0 and rs20 < 0:
+            codes.append("TREND_SLOPE_AND_RS_WEAK")
+        codes.append("DECISION_BREAKDOWN")
+    elif structure_state == "distribution":
+        if _long_upper_shadow(row):
+            codes.append("LONG_UPPER_SHADOW")
+        if volume_ratio >= 1.5 and close < ma5:
+            codes.append("VOLUME_EXPANSION_BELOW_MA5")
+        if near_recent_high and volume_ratio >= 1.3 and (k < d or macd_dif < macd_dea):
+            codes.append("NEAR_HIGH_MOMENTUM_WEAK")
+        if close < ma5 and (k < d or macd_dif < macd_dea):
+            codes.append("SHORT_TERM_MOMENTUM_WEAK")
+        codes.append("DECISION_DISTRIBUTION_PROTECTED" if timing_decision == "WAIT" else "DECISION_DISTRIBUTION_AVOID")
+    elif structure_state == "acceleration":
+        codes.append("MA_BULLISH_ACCELERATION")
+    elif structure_state == "pullback":
+        codes.append("PULLBACK_NEAR_MA20")
+    elif structure_state == "breakout":
+        codes.append("PRICE_NEAR_HIGH" if near_recent_high else "TREND_ABOVE_KEY_MA")
+    return list(dict.fromkeys(codes or ["TIMING_REASON_UNAVAILABLE"]))
+
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
@@ -254,6 +325,8 @@ def evaluate_timing(df: pd.DataFrame) -> dict:
             "timing_reason": "缺少行情指标数据，无法评估交易时机",
             "trend_strong": False,
             "timing_risk_tag": "",
+            "timing_reason_codes": ["TIMING_REASON_UNAVAILABLE"],
+            "timing_reason_texts": [TIMING_REASON_TEXT["TIMING_REASON_UNAVAILABLE"]],
         }
     structure = detect_structure_state(df)
     structure_state = structure["structure_state"]
@@ -266,6 +339,7 @@ def evaluate_timing(df: pd.DataFrame) -> dict:
         confidence["decision_confidence"],
         trend_strong,
     )
+    reason_codes = timing_reason_codes(df, structure_state, decision["timing_decision"])
     return {
         "structure_state": structure_state,
         "entry_quality_score": entry["entry_quality_score"],
@@ -276,4 +350,6 @@ def evaluate_timing(df: pd.DataFrame) -> dict:
         "timing_risk_tag": decision["timing_risk_tag"],
         "structure_reason": structure.get("structure_reason", ""),
         "entry_quality_parts": entry.get("entry_quality_parts", {}),
+        "timing_reason_codes": reason_codes,
+        "timing_reason_texts": [TIMING_REASON_TEXT.get(code, code) for code in reason_codes],
     }
